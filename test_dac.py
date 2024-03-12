@@ -3,11 +3,30 @@ from audiotools import AudioSignal
 
 import d_models
 import torch
-import confugue
 
-cfg_path = 'config.yaml'
-cfg = confugue.Configuration.from_yaml_file(cfg_path)
-network = cfg.configure(d_models.style_enc, config_path=cfg_path, logdir='logs')
+#create style encoders
+timbre_enc = d_models.style_enc(128)
+pitch_enc = d_models.style_enc(1)
+loudness_enc = d_models.style_enc(1)
+
+#create content enc
+content_enc = d_models.content_enc()
+
+#create decoder
+decoder = d_models.decoder(1154)
+
+#make test embedding
+test_e = torch.zeros(5, 1024,2411)
+
+#get encoder outputs
+out_ts = timbre_enc(test_e)
+out_ps  = pitch_enc(test_e)
+out_ls = loudness_enc(test_e)
+
+out_c = content_enc(test_e)[0]
+
+#decode
+print(decoder(torch.cat((out_ts, out_ps, out_ls, out_c),1)).shape)
 
 
 exit()
