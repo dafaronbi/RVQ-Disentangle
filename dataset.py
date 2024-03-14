@@ -82,7 +82,7 @@ class NSynth(data.Dataset):
             tuple: (audio sample, *categorical targets, json_data)
         """
         name = self.filenames[index]
-        sample, sr = librosa.load(name)
+        sample, sr = librosa.load(name, sr=44100)
         frame_size = len(sample)
         target = self.json_data[os.path.splitext(os.path.basename(name))[0]]
         categorical_target = [
