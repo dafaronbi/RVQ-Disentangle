@@ -94,7 +94,7 @@ class NSynth(data.Dataset):
                     case librosa.feature.mfcc:
                         mfcc = torch.tensor(transform(y=sample, sr = sr))
                     case librosa.pyin:
-                        pyin, _, _ = transform(y=sample, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr = sr)
+                        pyin, _, _ = transform(y=sample, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr = sr, fill_na=0.0)
                         pyin = torch.tensor(pyin).unsqueeze(0)
                     case librosa.feature.rms:
                         rms = torch.tensor(transform(y=sample))

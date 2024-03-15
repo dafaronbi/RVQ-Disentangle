@@ -111,9 +111,9 @@ for epoch in range(training_params["epochs"]):
         commitment_loss = vq_losses["commitment"]
         codebook_loss = vq_losses["codebook"]
 
-        mfcc_loss = criterion(nn.functional.pad(t_emb, (0,max(mfcc.shape[-1] - t_emb.shape[-1],0)), "constant",0), mfcc)
-        pitch_loss = criterion(nn.functional.pad(p_emb, (0,max(pitch.shape[-1] - p_emb.shape[-1],0)), "constant",0), pitch)
-        loudness_loss = criterion(nn.functional.pad(l_emb, (0,max(rms.shape[-1] - l_emb.shape[-1],0)), "constant",0), rms)
+        mfcc_loss = criterion(mfcc[..., :t_emb.shape[-1]], t_emb)
+        pitch_loss = criterion(pitch[..., :p_emb.shape[-1]], p_emb)
+        loudness_loss = criterion(rms[..., :l_emb.shape[-1]], l_emb)
 
         emb = torch.cat((t_emb, p_emb, l_emb, c_emb), 1)
 
@@ -132,6 +132,14 @@ for epoch in range(training_params["epochs"]):
         total_commitment_loss += commitment_loss.sum().item()
         total_codebook_loss += codebook_loss.sum().item()
 
+        print(f"Total Loss: {loss.sum().item()}")
+        print(f"Reconstruction Loss: {recon_loss.item()}")
+        print(f"Tibmre Loss: {mfcc_loss.item()}")
+        print(f"Pitch Loss: {pitch_loss.item()}")
+        print(f"Loudness Loss: {loudness_loss.item()}")
+        print(f"Commitment Loss: {commitment_loss.sum().item()}")
+        print(f"Codebook {codebook_loss.sum().item()}")
+
     writer.add_scalar("Loss/Total", total_train_loss, epoch)
     writer.add_scalar("Loss/recon", total_recon_loss, epoch)
     writer.add_scalar("Loss/mfcc", total_mfcc_loss, epoch)
@@ -140,15 +148,7 @@ for epoch in range(training_params["epochs"]):
     writer.add_scalar("Loss/commitmentl", total_commitment_loss, epoch)
     writer.add_scalar("Loss/codebook", total_codebook_loss, epoch)
 
-    if  epoch % 5 == 0:
-        print(f"Total Loss: {total_train_loss}")
-        print(f"Reconstruction Loss: {total_recon_loss}")
-        print(f"Tibmre Loss: {total_mfcc_loss}")
-        print(f"Pitch Loss: {total_pitch_loss}")
-        print(f"Loudness Loss: {total_loudness_loss}")
-        print(f"Commitment Loss: {total_commitment_loss}")
-        print(f"Codebook {total_codebook_loss}")
-
+    if  epoch % 2 == 0:
         if total_train_loss < best_train_loss:
                 best_train_loss = total_train_loss
                 torch.save(timbre_enc, training_params["save_path"] + "_t_enc.pt")
