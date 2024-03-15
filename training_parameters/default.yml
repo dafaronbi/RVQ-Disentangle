@@ -9,10 +9,10 @@ use_ema: False
 decay: 0.99
 epsilon: 0.00001
 sample_rate: 16000
-epochs: 1000
+epochs: 500
 lr: 0.00001
 beta: 0.10
-save_path: saved_models/test_vq.pt
-tb_path: tensorboard/test_vq_runs
-data_path: audio
-batch_size: 1
+save_path: saved_models/disentangle
+tb_path: tensorboard/test_disentangle_runs
+data_path: /vast/df2322/data/Nsynth/nsynth-test
+batch_size: 8

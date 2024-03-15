@@ -37,8 +37,6 @@ writer = SummaryWriter(training_params["tb_path"])
 # #get training and validation datasets
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-# device = 'cpu'
-
 
 dataset = dataset.NSynth(
         data_path,
@@ -58,6 +56,7 @@ content_enc = model.content_enc().to(device)
 #create decoder
 decoder = model.decoder(1046).to(device)
 
+#create DAC encoder and decoder
 model_path = dac.utils.download(model_type="44khz")
 model = dac.DAC.load(model_path).to(device)
 model.eval()
@@ -68,15 +67,7 @@ model.eval()
 lr = training_params["lr"]
 optimizer = optim.Adam(list(timbre_enc.parameters()) + list(pitch_enc.parameters()) + list(loudness_enc.parameters()) 
 + list(content_enc.parameters()) + list(decoder.parameters()), lr=lr)
-# criterion = auraloss.freq.MultiResolutionSTFTLoss(
-#     fft_sizes=[1024, 2048, 8192],
-#     hop_sizes=[256, 512, 2048],
-#     win_lengths=[1024, 2048, 8192],
-#     scale="mel",
-#     n_bins=128,
-#     sample_rate=sr,
-#     perceptual_weighting=True,
-# )
+
 criterion = torch.nn.MSELoss()
 
 # Train model.
@@ -106,7 +97,7 @@ for epoch in range(training_params["epochs"]):
         
         samples = samples.to(device)
         mfcc = mfcc.to(device)
-        pitch = pitch.to(device)
+        pitch = pitch.to(device).to(torch.float)
         rms = rms.to(device)
 
         z, codes, latents, _, _ = model.encode(samples[:,None,:])
@@ -115,6 +106,7 @@ for epoch in range(training_params["epochs"]):
         p_emb = pitch_enc(z)
         l_emb = loudness_enc(z)
         c_emb, _, vq_losses = content_enc(z)
+
 
         commitment_loss = vq_losses["commitment"]
         codebook_loss = vq_losses["codebook"]
@@ -129,58 +121,41 @@ for epoch in range(training_params["epochs"]):
         recon_loss = criterion(z, z_rec)
 
         loss = recon_loss + mfcc_loss + pitch_loss + loudness_loss + commitment_loss + codebook_loss
-        loss.mean().backward()
+        loss.sum().backward()
         optimizer.step()
 
-        total_train_loss += loss.item()
+        total_train_loss += loss.sum().item()
         total_recon_loss += recon_loss.item()
         total_mfcc_loss += mfcc_loss.item()
         total_pitch_loss += pitch_loss.item()
         total_loudness_loss += loudness_loss.item()
-        total_commitment_loss += commitment_loss.item()
-        total_codebook_loss += codebook_loss.item()
-        print("here")
+        total_commitment_loss += commitment_loss.sum().item()
+        total_codebook_loss += codebook_loss.sum().item()
 
-    
-    print(f"Total Loss: {total_train_loss}")
-    print(f"Reconstruction Loss: {total_recon_loss}")
-    print(f"Tibmre Loss: {total_mfcc_loss}")
-    print(f"Pitch Loss: {total_pitch_loss}")
-    print(f"Loudness Loss: {total_loudness_loss}")
-    print(f"Commitment Loss: {total_commitment_loss}")
-    print(f"Codebook {total_codebook_loss}")
+    writer.add_scalar("Loss/Total", total_train_loss, epoch)
+    writer.add_scalar("Loss/recon", total_recon_loss, epoch)
+    writer.add_scalar("Loss/mfcc", total_mfcc_loss, epoch)
+    writer.add_scalar("Loss/pitch", total_pitch_loss, epoch)
+    writer.add_scalar("Loss/loudness", total_loudness_loss, epoch)
+    writer.add_scalar("Loss/commitmentl", total_commitment_loss, epoch)
+    writer.add_scalar("Loss/codebook", total_codebook_loss, epoch)
 
-        # optimizer.zero_grad()
-        # audio = train_tensors[0].to(device)
-        # out = network(audio)
-        # recon_error = criterion(out["x_recon"], audio)
-        # total_recon_error += recon_error.item()
-        # loss = recon_error + beta * out["commitment_loss"]
-        # if not training_params["use_ema"]:
-        #     loss += out["dictionary_loss"]
+    if  epoch % 5 == 0:
+        print(f"Total Loss: {total_train_loss}")
+        print(f"Reconstruction Loss: {total_recon_loss}")
+        print(f"Tibmre Loss: {total_mfcc_loss}")
+        print(f"Pitch Loss: {total_pitch_loss}")
+        print(f"Loudness Loss: {total_loudness_loss}")
+        print(f"Commitment Loss: {total_commitment_loss}")
+        print(f"Codebook {total_codebook_loss}")
 
-        # total_train_loss += loss.item()
-        # loss.backward()
-        # optimizer.step()
-        # n_train += 1
-
-        # if ((batch_idx + 1) % eval_every) == 0:
-        #     print(f"epoch: {epoch}\nbatch_idx: {batch_idx + 1}", flush=True)
-        #     total_train_loss /= n_train
-        #     if total_train_loss < best_train_loss:
-        #         best_train_loss = total_train_loss
-        #         torch.save(network, training_params["save_path"])
-
-        #     print(f"total_train_loss: {total_train_loss}")
-        #     print(f"best_train_loss: {best_train_loss}")
-        #     print(f"recon_error: {total_recon_error / n_train}\n")
-
-        #     writer.add_scalar("Loss/Total", total_train_loss, epoch)
-        #     writer.add_scalar("Loss/Reconstruction", total_recon_error, epoch)
-
-        #     total_train_loss = 0
-        #     total_recon_error = 0
-        #     n_train = 0
+        if total_train_loss < best_train_loss:
+                best_train_loss = total_train_loss
+                torch.save(timbre_enc, training_params["save_path"] + "_t_enc.pt")
+                torch.save(pitch_enc, training_params["save_path"] + "_p_enc.pt")
+                torch.save(loudness_enc, training_params["save_path"] + "_l_enc.pt")
+                torch.save(content_enc, training_params["save_path"] + "_c_enc.pt")
+                torch.save(decoder, training_params["save_path"] + "_dec.pt")
     
 
 # Generate and save reconstructions.
@@ -192,5 +167,5 @@ for epoch in range(training_params["epochs"]):
 # writer.add_audio("Input Audio "  , audio[0][0], 0, 16000)
 # writer.add_audio("Reconstuction " , out["x_recon"][0], 0, 16000)
 
-# writer.flush()
-# writer.close()
+writer.flush()
+writer.close()
