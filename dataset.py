@@ -62,6 +62,14 @@ class NSynth(data.Dataset):
         self.transforms = transforms
         self.target_transform = target_transform
 
+        #initialize normalization values
+        self.mfcc_max = 341.15484619140625
+        self.mfcc_min = -968.44970703125
+        self.pitch_max = 2093.004522404789
+        self.pitch_min = 0
+        self.rms_max = 0.9348938465118408
+        self.rms_min = 0
+
     def blacklist(self, filenames, json_data, pattern):
         filenames = [filename for filename in filenames
                      if pattern not in filename]
@@ -84,22 +92,32 @@ class NSynth(data.Dataset):
         name = self.filenames[index]
         sample, sr = librosa.load(name, sr=44100)
         frame_size = len(sample)
-        target = self.json_data[os.path.splitext(os.path.basename(name))[0]]
-        categorical_target = [
-            le.transform([target[field]])[0]
-            for field, le in zip(self.categorical_field_list, self.le)]
-        if self.transforms is not None:
-            for transform in self.transforms:
-                match transform:
-                    case librosa.feature.mfcc:
-                        mfcc = torch.tensor(transform(y=sample, sr = sr))
-                    case librosa.pyin:
-                        pyin, _, _ = transform(y=sample, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr = sr, fill_na=0.0)
-                        pyin = torch.tensor(pyin).unsqueeze(0)
-                    case librosa.feature.rms:
-                        rms = torch.tensor(transform(y=sample))
-        if self.target_transform is not None:
-            target = self.target_transform(target)
+
+        mfcc = torch.from_numpy(np.load(name[:-4] + "_mfcc.npy"))
+        pyin = torch.from_numpy(np.load(name[:-4] + "_pitch.npy"))
+        rms = torch.from_numpy(np.load(name[:-4] + "_rms.npy"))
+        # target = self.json_data[os.path.splitext(os.path.basename(name))[0]]
+        # categorical_target = [
+        #     le.transform([target[field]])[0]
+        #     for field, le in zip(self.categorical_field_list, self.le)]
+        # if self.transforms is not None:
+        #     for transform in self.transforms:
+        #         match transform:
+        #             case librosa.feature.mfcc:
+        #                 mfcc = torch.tensor(transform(y=sample, sr = sr))
+        #             case librosa.pyin:
+        #                 pyin, _, _ = transform(y=sample, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr = sr, fill_na=0.0)
+        #                 pyin = torch.tensor(pyin).unsqueeze(0)
+        #             case librosa.feature.rms:
+        #                 rms = torch.tensor(transform(y=sample))
+        # if self.target_transform is not None:
+        #     target = self.target_transform(target)
+
+        #normalize data
+        mfcc = (mfcc - self.mfcc_min) / ( self.mfcc_max -self.mfcc_min)
+        pyin = (pyin - self.pitch_min) / (self.pitch_max - self.pitch_min) 
+        # rms = (rms - rms_min) / (rms_max - rms_min)
+        
         return [sample, mfcc, pyin, rms]
 
 
