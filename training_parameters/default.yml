@@ -7,12 +7,14 @@ embedding_dim: 64
 num_embeddings: 512
 use_ema: False
 decay: 0.99
-epsilon: 0.00001
+epsilon: 0.0001
 sample_rate: 16000
 epochs: 500
-lr: 0.00001
+lr: 0.0001
 beta: 0.10
 save_path: saved_models/disentangle
 tb_path: tensorboard/test_disentangle_runs
 data_path: /vast/df2322/data/Nsynth/nsynth-test
-batch_size: 8
+validation_data_path: /vast/df2322/data/Nsynth/nsynth-valid
+batch_size: 4
+save_frequency: 1

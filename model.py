@@ -34,7 +34,8 @@ class style_enc(nn.Module):
         nn.BatchNorm1d(1024),
         nn.ReLU(),
         nn.Conv1d(in_channels=1024, out_channels=output_size, kernel_size=1, stride=1),
-        nn.ReLU(),
+        # nn.ReLU(),
+        nn.Sigmoid()
             )
 
         # self.style_encoder_rnn = nn.GRU(input_size=1024, hidden_size=1024, batch_first=True)
