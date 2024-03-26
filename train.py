@@ -121,18 +121,18 @@ optimizer = optim.Adam(list(timbre_enc.parameters()) + list(pitch_enc.parameters
 criterion = torch.nn.MSELoss()
 
 # Train model.
-epochs = 7
 eval_every = 1
-beta = training_params["beta"]
 best_train_loss = float("inf")
 timbre_enc.train()
 pitch_enc.train()
 loudness_enc.train()
-content_enc.train()
-decoder.train()
+content_enc.eval()
+decoder.eval()
 
 for epoch in range(training_params["epochs"]):
-    
+
+    print(f"Epoch: {epoch}")
+
     total_train_loss = 0
     total_recon_loss = 0
     total_mfcc_loss = 0
@@ -171,9 +171,17 @@ for epoch in range(training_params["epochs"]):
         z_rec = decoder(emb)
         recon_loss = criterion(z, z_rec)
 
-        loss = recon_loss + mfcc_loss + pitch_loss + loudness_loss + commitment_loss + codebook_loss
-        loss.sum().backward()
-        optimizer.step()
+        if epoch > 100:
+            content_enc.train()
+            decoder.train()
+            loss = recon_loss + mfcc_loss + pitch_loss + loudness_loss + commitment_loss + codebook_loss
+            loss.sum().backward()
+            optimizer.step()
+        
+        else:
+            loss = mfcc_loss + pitch_loss + loudness_loss
+            loss.sum().backward()
+            optimizer.step()
 
         total_train_loss += loss.sum().item()
         total_recon_loss += recon_loss.item()
@@ -182,14 +190,6 @@ for epoch in range(training_params["epochs"]):
         total_loudness_loss += loudness_loss.item()
         total_commitment_loss += commitment_loss.sum().item()
         total_codebook_loss += codebook_loss.sum().item()
-
-        print(f"Total Loss: {loss.sum().item()}")
-        print(f"Reconstruction Loss: {recon_loss.item()}")
-        print(f"Tibmre Loss: {mfcc_loss.item()}")
-        print(f"Pitch Loss: {pitch_loss.item()}")
-        print(f"Loudness Loss: {loudness_loss.item()}")
-        print(f"Commitment Loss: {commitment_loss.sum().item()}")
-        print(f"Codebook Loss: {codebook_loss.sum().item()}")
 
     writer.add_scalar("Loss/Total", total_train_loss, epoch)
     writer.add_scalar("Loss/recon", total_recon_loss, epoch)
@@ -228,7 +228,7 @@ for epoch in range(training_params["epochs"]):
                 emb = torch.cat((t_emb, p_emb, l_emb, c_emb), 1)
                 z_rec = decoder(emb)
 
-                output_audio = model.decode(z)
+                output_audio = model.decode(z_rec)
 
                 writer.add_audio(f"Audio/Input-{i}:"  , samples)
                 writer.add_audio(f"Audio/Reconstruction-{i}" , output_audio[0])
