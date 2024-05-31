@@ -15,7 +15,7 @@ def make_pyin_img(samples, pyin):
     f0 = pyin[0].cpu().detach().numpy()
     times = librosa.times_like(f0)
 
-    y = samples.cpu().numpy()
+    y = samples.cpu().detach().numpy()
 
 
     D = librosa.amplitude_to_db(np.abs(librosa.stft(y.T)), ref=np.max)
@@ -61,7 +61,9 @@ sr = 44100
 
 #data setup
 data_path = "/vast/df2322/data/Nsynth/nsynth-valid"
-data = dataset.NSynth(data_path)
+data = dataset.NSynth_ram(data_path)
+# d_path = ["train_tensor_" + str(i) + ".pt" for i in range(12)]
+# data = dataset.NSynth_ram(d_path)
 train_loader = torch.utils.data.DataLoader(data, batch_size=1, shuffle=True)
 
 #set device used to perform training
@@ -71,11 +73,11 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 writer = SummaryWriter("tensorboard/inference_runs")
 
 #load saved models
-c_enc = torch.load("saved_models/c_enc.pt").to(device)
-t_enc = torch.load("saved_models/t_enc.pt").to(device)
-p_enc = torch.load("saved_models/p_enc.pt").to(device)
-l_enc = torch.load("saved_models/l_enc.pt").to(device)
-dec = torch.load("saved_models/dec.pt").to(device)
+c_enc = torch.load("saved_models/disentangle_c_enc.pt",map_location=torch.device('cpu')).to(device)
+t_enc = torch.load("saved_models/disentangle_t_enc.pt",map_location=torch.device('cpu')).to(device)
+p_enc = torch.load("saved_models/disentangle_p_enc.pt",map_location=torch.device('cpu')).to(device)
+l_enc = torch.load("saved_models/disentangle_l_enc.pt",map_location=torch.device('cpu')).to(device)
+dec = torch.load("saved_models/disentangle_dec.pt",map_location=torch.device('cpu')).to(device)
 
 #create DAC encoder and decoder
 model_path = dac.utils.download(model_type="44khz")
@@ -83,14 +85,49 @@ model = dac.DAC.load(model_path).to(device)
 model.eval()
 
 for i in range(3):
-    samples,mfcc,pyin, rms = next(iter(train_loader))
+    # samples,mfcc,pyin, rms = next(iter(train_loader))
 
-    samples = samples.to(device)
+    # samples = samples.to(device)
+    # mfcc = mfcc.to(device)
+    # pyin = pyin.to(device)
+    # rms = rms.to(device)
+
+    # z, codes, latents, _, _ = model.encode(samples[:,None,:])
+
+    # c_emb, _, vq_losses = c_enc(z)
+    # t_emb = t_enc(z)
+    # p_emb = p_enc(z)
+    # l_emb = l_enc(z)
+
+    # emb = torch.cat((t_emb, p_emb, l_emb, c_emb), 1)
+    # z_rec = dec(emb)
+
+    # output_audio = model.decode(z_rec)
+
+    # writer.add_audio(f"Audio/Input-{i}:"  , samples)
+    # writer.add_audio(f"Audio/Reconstruction-{i}" , output_audio[0])
+
+    # samples = samples[0]
+    # pyin =  (pyin * (data.pitch_max - data.pitch_min) - data.pitch_min)[0]
+    # p_pred = (p_emb * (data.pitch_max - data.pitch_min) - data.pitch_min)[0]
+    # mfcc =  mfcc * (data.mfcc_max - data.mfcc_min) - data.mfcc_min
+    # t_pred = (t_emb * (data.pitch_max - data.pitch_min) - data.pitch_min)
+
+
+    # writer.add_image(f"Pitch/Input-{i}", make_pyin_img(samples, pyin), dataformats='HWC')
+    # writer.add_image(f"Pitch/Reconstruction-{i}", make_pyin_img(samples, p_pred), dataformats='HWC')
+
+    # writer.add_image(f"MFCC/Input-{i}", make_mfcc_img(mfcc), dataformats='HWC')
+    # writer.add_image(f"MFCC/Reconstruction-{i}", make_mfcc_img(t_pred), dataformats='HWC')
+
+    # writer.add_image(f"RMS/Input-{i}", make_rms_img(rms), dataformats='HWC')
+    # writer.add_image(f"RMS/Reconstruction-{i}", make_rms_img(l_emb), dataformats='HWC')
+    z,mfcc,pyin, rms = next(iter(train_loader))
+
+    z = z.to(device)[:,0,:,:]
     mfcc = mfcc.to(device)
     pyin = pyin.to(device)
     rms = rms.to(device)
-
-    z, codes, latents, _, _ = model.encode(samples[:,None,:])
 
     c_emb, _, vq_losses = c_enc(z)
     t_emb = t_enc(z)
@@ -98,14 +135,16 @@ for i in range(3):
     l_emb = l_enc(z)
 
     emb = torch.cat((t_emb, p_emb, l_emb, c_emb), 1)
+
     z_rec = dec(emb)
 
-    output_audio = model.decode(z)
+    input_audio = model.decode(z)
+    output_audio = model.decode(z_rec)
 
-    writer.add_audio(f"Audio/Input-{i}:"  , samples)
+    writer.add_audio(f"Audio/Input-{i}:"  , input_audio[0])
     writer.add_audio(f"Audio/Reconstruction-{i}" , output_audio[0])
 
-    samples = samples[0]
+    samples = input_audio[0][0]
     pyin =  (pyin * (data.pitch_max - data.pitch_min) - data.pitch_min)[0]
     p_pred = (p_emb * (data.pitch_max - data.pitch_min) - data.pitch_min)[0]
     mfcc =  mfcc * (data.mfcc_max - data.mfcc_min) - data.mfcc_min
