@@ -27,11 +27,11 @@ class style_enc(nn.Module):
             nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=5, stride=1, padding=2),
             nn_custom.ResidualWrapper(
             nn.Sequential(
-            nn.BatchNorm1d(1024),
+            nn.SyncBatchNorm(1024),
             nn.ReLU(),
             nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=1, stride=1),
         )),
-        nn.BatchNorm1d(1024),
+        nn.SyncBatchNorm(1024),
         nn.ReLU(),
         nn.Conv1d(in_channels=1024, out_channels=output_size, kernel_size=1, stride=1),
         # nn.ReLU(),
@@ -67,7 +67,6 @@ class style_enc(nn.Module):
         #     encoded = torch.matmul(encoded, encoded.transpose(1, 2))
         # encoded = encoded.reshape(encoded.shape[0], -1)
 
-
         return encoded, {}
 
     def forward(self, input_e):
@@ -79,17 +78,17 @@ class content_enc(nn.Module):
         super().__init__()
         self.content_encoder = nn.Sequential(
         nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=5, stride=1, padding=2),
-        # nn.BatchNorm1d(1024),
+        # nn.SyncBatchNorm(1024),
         # nn.LeakyReLU(negative_slope=0.01),
         # nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=4, stride=2, padding=2),
         nn_custom.ResidualWrapper(
             nn.Sequential(
-            nn.BatchNorm1d(1024),
+            nn.SyncBatchNorm(1024),
             nn.ReLU(),
             nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=1, stride=1),
         )
         ),
-        nn.BatchNorm1d(1024),
+        nn.SyncBatchNorm(1024),
         )
         self.vq = vq_custom.VQEmbedding(2048, 1024, axis=1)
 
@@ -97,27 +96,27 @@ class content_enc(nn.Module):
         encoded = self.content_encoder(input)
         if self.vq is None:
             return encoded, encoded, {}
-        return self.vq(encoded)
+        return encoded #self.vq(encoded) 
     
     def forward(self, input_e):
-        encoded_c, _, losses_c = self.encode_content(input_e)
-        return encoded_c, _, losses_c
+        # encoded_c, _, losses_c = self.encode_content(input_e)
+        return self.encode_content(input_e), 0, {"commitment": torch.tensor(0), "codebook": torch.tensor(0)} #encoded_c, _, losses_c
 
 class decoder(nn.Module):
     def __init__(self, num_features=1024):
         super().__init__()
         self.decoder = nn.Sequential(
-                nn.BatchNorm1d(num_features),
+                nn.SyncBatchNorm(num_features),
                 nn.ConvTranspose1d(num_features, 1024, 1, 1),
                 nn_custom.ResidualWrapper(
                     nn.Sequential(
-                    nn.BatchNorm1d(1024),
+                    nn.SyncBatchNorm(1024),
                     nn.ReLU(),
                 )
                 ),
                 nn.ReLU(),
                 nn.ConvTranspose1d(1024, 1024, kernel_size=5, stride=1, padding=2),
-                nn.BatchNorm1d(1024),
+                nn.SyncBatchNorm(1024),
                 nn.ReLU(),
             )
         
