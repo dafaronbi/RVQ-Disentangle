@@ -34,7 +34,7 @@ for filename in filenames:
     # pyin = np.expand_dims(pyin,0)
     # rms = librosa.feature.rms(y=samples)
 
-    np.save(filename[:-4] + "_z", z.detach().cpu().numpy())
+    np.save(filename[:-4] + "_zcodes", codes.detach().cpu().numpy())
     # np.save(filename[:-4] + "_mfcc", mfcc)
     # np.save(filename[:-4] + "_pitch", pyin)
     # np.save(filename[:-4] + "_rms", rms)

@@ -1,21 +1,42 @@
-in_channels: 1
-num_hidddens: 128
-num_downsampling_layers: 4
-num_residual_layers: 4
-num_residual_hiddens: 32
-embedding_dim: 64
-num_embeddings: 512
-use_ema: False
-decay: 0.99
-epsilon: 0.0001
-sample_rate: 44100
+lr: 0.02
+save_path: saved_models/disentangle.pt
+tb_path: tensorboard/disentangle
+data_path:
+  - train_tensor_JC_0.pt
+  - train_tensor_JC_1.pt
+  - train_tensor_JC_2.pt
+  - train_tensor_JC_3.pt
+  - train_tensor_JC_4.pt
+  - train_tensor_JC_5.pt
+  - train_tensor_JC_6.pt
+  - train_tensor_JC_7.pt
+  - train_tensor_JC_8.pt
+  - train_tensor_JC_9.pt
+  - train_tensor_JC_10.pt
+  - train_tensor_JC_11.pt
+  - train_tensor_JC_12.pt
+  - train_tensor_JC_13.pt
+  - train_tensor_JC_14.pt
+  - train_tensor_JC_15.pt
+  - train_tensor_JC_16.pt
+  - train_tensor_JC_17.pt
+  - train_tensor_JC_18.pt
+  - train_tensor_JC_19.pt
+  - train_tensor_JC_20.pt
+  - train_tensor_JC_21.pt
+  - train_tensor_JC_22.pt
+  - train_tensor_JC_23.pt
+validation_data_path: 
+  - valid_tensor_JC_0.pt
+  - valid_tensor_JC_1.pt
+test_data_path: 
+  - test_tensor_JC_0.pt
+batch_size: 400
+verbos: True
+encoder_epochs: 30
+train_encoder: False
+train_continue: False
 epochs: 500
-lr: 0.0001
-beta: 0.10
-save_path: saved_models/disentangle
-tb_path: tensorboard/test_disentangle_runs
-data_path: /nsynth-train
-validation_data_path: /nsynth-valid
-test_data_path: /nsynth-test
-batch_size: 512
-save_frequency: 1
+v_frequency: 10
+instruments: null
+num_workers: 0
