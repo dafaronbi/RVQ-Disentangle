@@ -46,3 +46,24 @@ class ResidualWrapper(nn.Module):
         if output.shape != input.shape:
             raise RuntimeError(f'Expected output to have shape {input.shape}, got {output.shape}')
         return output + input
+
+class SwapAxes(nn.Module):
+    def __init__(self, ax):
+        super().__init__()
+        self.ax = ax
+
+    def forward(self, x):
+        return x.swapaxes(*self.ax)
+
+#Gru that doesn't return hidden so it can be used in sequential
+class GRUWrap(nn.Module):
+    """Wrapper for adding a skip connection around a module."""
+
+    def __init__(self, input_size, hidden_size, num_layers=1, batch_first=False):
+        super().__init__()
+        
+        self.gruWrap = nn.GRU(input_size,hidden_size,num_layers,batch_first)
+
+    def forward(self, input):
+        out,_ = self.gruWrap(input.transpose(1, 2))
+        return out.transpose(1,2)

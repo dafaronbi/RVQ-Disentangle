@@ -11,11 +11,13 @@ import librosa
 from audiotools import AudioSignal
 import numpy as np
 import matplotlib.pyplot as plt
-
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torchmetrics.clustering import MutualInfoScore
+import matplotlib.pyplot as plt
+import random
 
 def ddp_setup(rank: int, world_size: int):
     """
@@ -24,17 +26,20 @@ def ddp_setup(rank: int, world_size: int):
     world_size: Total number of processes
     """
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ["MASTER_PORT"] = "12356"
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+def ddp_cleanup():
+    destroy_process_group()
 
 def grab_buffer(fig):
     data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
     data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
     return data
 
-def make_pyin_img(samples, pyin):
-    f0 = pyin[0].cpu().detach().numpy()
+def make_pitch_img(samples, p):
+    f0 = p[0].cpu().detach().numpy()
     times = librosa.times_like(f0)
 
     y = samples.cpu().detach().numpy()
@@ -43,7 +48,7 @@ def make_pyin_img(samples, pyin):
     D = librosa.amplitude_to_db(np.abs(librosa.stft(y.T)), ref=np.max)
     fig, ax = plt.subplots()
     img = librosa.display.specshow(D, x_axis='time', y_axis='log', ax=ax)
-    ax.set(title='pYIN fundamental frequency estimation')
+    ax.set(title='fundamental frequency estimation')
     fig.colorbar(img, ax=ax, format="%+2.f dB")
     ax.plot(times, f0, label='f0', color='cyan', linewidth=3)
     ax.legend(loc='upper right')
@@ -91,287 +96,515 @@ def main(rank, world_size):
     with open(args.params) as f:
         training_params = yaml.safe_load(f)
 
-    gpu_count = torch.cuda.device_count()
-    # How many GPUs are there?
-    if rank == 0:
-        print("GPU COUNT: " + str(gpu_count))
-
-    # #set training parameters
-    # epochs = int(training_params["epochs"])
-    # lr = float(training_params["lr"])
     save_path = training_params["save_path"]
     data_path = training_params["data_path"]
     v_data_path = training_params["validation_data_path"]
     batch_size = training_params["batch_size"]
 
-    #log for tensorboard
-    writer = SummaryWriter(training_params["tb_path"])
+    gpu_count = torch.cuda.device_count()
+    # How many GPUs are there?
+    if rank == 0:
+        print("GPU COUNT: " + str(gpu_count))
 
 
     #get training and validation datasets
     # device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     device = rank
+    if rank == 0:
+        print("LOADING TRAINING DATA...")
+    # d_path = ["train_tensor_" + str(i) + ".pt" for i in range(12)]
+    # d_path = ["test_tensor_JC_" + str(i) + ".pt" for i in range(1)]
+    data = dataset.NSynth_transform_ram(training_params["data_path"], instruments=training_params["instruments"])
+    train_loader = torch.utils.data.DataLoader(data, batch_size=batch_size, sampler=DistributedSampler(data), drop_last=False, num_workers=training_params["num_workers"])
+    if rank == 0:
+        print("DONE!!")
 
-    print("LOADING TRAINING DATA...")
-    # data = dataset.NSynth(data_path)
-    # train_loader = torch.utils.data.DataLoader(data, batch_size=batch_size, shuffle=False, sampler=DistributedSampler(data), drop_last=True, num_workers=1*gpu_count)
-
-    d_path = ["train_tensor_" + str(i) + ".pt" for i in range(12)]
-    data = dataset.NSynth_ram(d_path)
-    train_loader = torch.utils.data.DataLoader(data, batch_size=batch_size, sampler=DistributedSampler(data), drop_last=True, num_workers=0*gpu_count)
-    print("DONE!!")
-
-    print("LOADING VALIDATION DATA...")
-    #data setup
-    vd_path = ['valid_tensor.pt']
-    v_data = dataset.NSynth_ram(vd_path)
-    valid_loader = torch.utils.data.DataLoader(v_data, batch_size=1, shuffle=True)
-    print("DONE!!")
-    
-    #create style encoders
-    timbre_enc = model.style_enc(20).to(device)
-    pitch_enc = model.style_enc(1).to(device)
-    loudness_enc = model.style_enc(1).to(device)
-
-    #create content enc
-    content_enc = model.content_enc().to(device)
-
-    #create decoder
-    decoder = model.decoder(1046).to(device)
+    valid_loader = train_loader
 
     if rank == 0:
-        n_params = 0
-        n_params += sum([np.prod(p.size()) for p in timbre_enc.parameters()])
-        n_params += sum([np.prod(p.size()) for p in pitch_enc.parameters()])
-        n_params += sum([np.prod(p.size()) for p in loudness_enc.parameters()])
-        n_params += sum([np.prod(p.size()) for p in content_enc.parameters()])
-        n_params += sum([np.prod(p.size()) for p in decoder.parameters()])
-        print(f"# paramers is: {n_params}")
+        print("LOADING VALIDATION DATA...")
+    # d_path = ["train_tensor_" + str(i) + ".pt" for i in range(12)]
+    # v_d_path = ['valid_tensor_JC_0.pt', 'valid_tensor_JC_1.pt']
+    v_data = dataset.NSynth_transform_ram(training_params["validation_data_path"], instruments=training_params["instruments"])
+    valid_loader = torch.utils.data.DataLoader(v_data, batch_size=5, sampler=DistributedSampler(data), drop_last=False, num_workers=training_params["num_workers"])
+    if rank == 0:
+        print("DONE!!")
 
-    #Move to DDP
-    timbre_enc = DDP(timbre_enc, device_ids=[device])
-    pitch_enc = DDP(pitch_enc, device_ids=[device])
-    loudness_enc = DDP(loudness_enc, device_ids=[device])
-    content_enc = DDP(content_enc, device_ids=[device])
-    decoder = DDP(decoder, device_ids=[device])
+    v_frequency = training_params["v_frequency"]
+
+
+    disentangle = model.disentangle(device=rank).to(device)
+    disentangle = DDP(disentangle, device_ids=[device], output_device=rank, find_unused_parameters=True)
 
     # Initialize optimizer.
     lr = training_params["lr"]
-    optimizer = optim.Adam(list(timbre_enc.module.parameters()) + list(pitch_enc.module.parameters()) + list(loudness_enc.module.parameters()) 
-    + list(content_enc.module.parameters()) + list(decoder.module.parameters()), lr=lr)
 
-    criterion = torch.nn.MSELoss()
+    optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" not in name and "mfcc_predict" not in name and "rms_predict" not in name and "dacModel" not in name], lr=lr)
+    rest_parameters = [name for name, p in disentangle.module.named_parameters() if "pitch_predict" not in name and "mfcc_predict" not in name and "rms_predict" not in name and "dacModel" not in name]
+    
+    
+    #optimizer for feature vectors
+    feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name ], lr=lr)
+    enc_parameters = [name for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name ]
+    #add learning rate decay
+    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, gamma=0.99)
 
-    # Train model.
-    eval_every = 1
-    best_train_loss = float("inf")
-    timbre_enc.train()
-    pitch_enc.train()
-    loudness_enc.train()
-    content_enc.eval()
-    decoder.eval()
+    #log for tensorboard
+    writer = SummaryWriter(training_params["tb_path"])
 
-    for epoch in range(training_params["epochs"]):
-        if rank == 0:
-            print(f"Epoch: {epoch}")
+    if training_params["train_continue"]:
+        old_model = torch.load(save_path).to(device)
+        disentangle = disentangle.module
+        disentangle.load_state_dict(old_model.state_dict())
+        disentangle = DDP(disentangle, device_ids=[device], output_device=rank, find_unused_parameters=True)
+        optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" not in name and "mfcc_predict" not in name and "rms_predict" not in name and "dacModel" not in name], lr=lr)
+        feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name ], lr=lr)
+        torch.distributed.barrier()
 
-        train_loader.sampler.set_epoch(epoch)
-        valid_loader.sampler.set_epoch(epoch)
+    if training_params["train_encoder"]:
+        epochs = training_params["encoder_epochs"]
+        for epoch in range(1, epochs+1):
+            disentangle.train()
+            train_loader.sampler.set_epoch(epoch)
 
+            loss_total_pitch = 0
+            loss_total_mfcc = 0
+            loss_total_rms = 0
 
-        total_train_loss = 0
-        total_recon_loss = 0
-        total_mfcc_loss = 0
-        total_pitch_loss = 0
-        total_loudness_loss = 0
-        total_commitment_loss = 0
-        total_codebook_loss = 0
+            for (batch_idx, train_tensors) in enumerate(train_loader):
+                z,p,mfcc,rms,z_prime,p_prime,mfcc_prime,rms_prime = train_tensors   
 
-        if rank == 0:
-                print("data loading...")
+                z = z.to(device)[:,0,:,:]
+                p = p.to(device)
+                mfcc = mfcc.to(device)
+                rms = rms.to(device)
+                l,_ = disentangle.module.train_enc(z,p,mfcc, rms)
+
+                loss = l["p_predict"] + l["m_predict"] + l["r_predict"]
+                loss.sum().backward()
+                torch.nn.utils.clip_grad_norm_(disentangle.parameters(), 0.0001)
+
+                feature_optimizer.step()
+                feature_optimizer.zero_grad(set_to_none=True)
+
+                loss_total_pitch +=  l["p_predict"].item() 
+                loss_total_mfcc += l["m_predict"].item()
+                loss_total_rms += l["r_predict"].item()
+
+                if training_params["verbos"]:
+                    if rank == 0:
+                        print(f"sample {batch_idx + 1} out of {len(train_loader)}")
+                        print(loss.item())
+            
+            writer.add_scalar("Encoder Loss/Pitch Predict", loss_total_pitch / len(train_loader), epoch)
+            writer.add_scalar("Encoder Loss/Timbre Predict", loss_total_mfcc / len(train_loader), epoch)
+            writer.add_scalar("Encoder Loss/Loudness Predict", loss_total_rms / len(train_loader), epoch)
+    else:
+        old_model = torch.load(save_path).to(device)
+        disentangle = disentangle.module
+        disentangle.pitch_predict.load_state_dict(old_model.pitch_predict.state_dict())
+        disentangle.mfcc_predict.load_state_dict(old_model.mfcc_predict.state_dict())
+        disentangle.rms_predict.load_state_dict(old_model.rms_predict.state_dict())
+        disentangle = DDP(disentangle, device_ids=[device], output_device=rank, find_unused_parameters=True)
+        optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" not in name and "mfcc_predict" not in name and "rms_predict" not in name and "dacModel" not in name], lr=lr)
+        feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name ], lr=lr)
+        torch.distributed.barrier()
+
+    # epochs = training_params["epochs"]
+    # for epoch in range(1, epochs+1):
+    #     disentangle.train()
+    #     train_loader.sampler.set_epoch(epoch + training_params["encoder_epochs"])
+
+    #     loss_total_r = 0
+
+    #     for (batch_idx, train_tensors) in enumerate(train_loader):
+            
+    #         z,p,mfcc,rms,z_prime,p_prime,mfcc_prime,rms_prime = train_tensors   
+
+    #         z = z.to(device)[:,0,:,:]
+    #         z_prime = z_prime.to(device)[:,0,:,:]
+    #         p_prime = p.to(device)
+    #         mfcc_prime = mfcc_prime.to(device)
+    #         rms_prime = rms_prime.to(device)
+    #         l,_ = disentangle.module.train_recon(z,z_prime, p_prime,mfcc_prime, rms_prime)
+
+    #         loss = l["t_predict"] 
+            
+
+    #         loss.backward()
+    #         torch.nn.utils.clip_grad_norm_(disentangle.parameters(), 0.0001)
+
+    #         optimizer.step()
+    #         optimizer.zero_grad(set_to_none=True)
+
+    #         loss_total_r +=  loss
+
+    #         if training_params["verbos"]:
+    #             if rank == 0:
+    #                 print(f"sample {batch_idx + 1} out of {len(train_loader)}")
+    #                 print(loss.item())
+        
+    #     writer.add_scalar("Loss/Recon", loss_total_r / len(train_loader), epoch)
+
+    epochs = training_params["epochs"]
+    for epoch in range(1,epochs+1): 
+        disentangle.train()
+
+        train_loader.sampler.set_epoch(epoch + training_params["encoder_epochs"])
+
+        loss_total = 0
+        loss_total_pitch = 0
+        loss_total_mfcc = 0
+        loss_total_rms = 0
+        loss_total_r = 0
+        loss_total_ce = 0
+
         for (batch_idx, train_tensors) in enumerate(train_loader):
-            if rank == 0:
-                print("DONE!!!")
-            # print(f"Batch: {batch_idx}")
-            loss = 0
-            z, mfcc, pitch, rms = train_tensors
-            
+            z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = train_tensors   
+
             z = z.to(device)[:,0,:,:]
+            p = p.to(device)
             mfcc = mfcc.to(device)
-            pitch = pitch.to(device).to(torch.float)
             rms = rms.to(device)
-
-
-            t_emb = timbre_enc(z)
-            p_emb = pitch_enc(z)
-            l_emb = loudness_enc(z)
-            c_emb, _, vq_losses = content_enc(z)
-
+            inst = inst.to(device)
+            z_prime = z_prime.to(device)[:,0,:,:]
+            p_prime = p_prime.to(device)
+            mfcc_prime = mfcc_prime.to(device)
+            rms_prime = rms_prime.to(device)
+            inst_prime = inst_prime.to(device)
+            l,_ = disentangle(z,p,mfcc,rms,inst,z_prime, p_prime, mfcc_prime, rms_prime, inst_prime)
             
-            commitment_loss = vq_losses["commitment"]
-            codebook_loss = vq_losses["codebook"]
+            # if epoch < training_params["encoder_epochs"]:
+            #     loss = l["p_predict"] + l["m_predict"] + l["r_predict"]
+            # else:
+            #     loss = l["t_predict"] + l["p_ce_loss"] + l["m_ce_loss"] + l["r_ce_loss"] + l["pm_ce_loss"] + l ["pr_ce_loss"] + l["mr_ce_loss"]
 
-            mfcc_loss = criterion(mfcc[..., :t_emb.shape[-1]], t_emb)
-            pitch_loss = criterion(pitch[..., :p_emb.shape[-1]], p_emb)
-            loudness_loss = criterion(rms[..., :l_emb.shape[-1]], l_emb)
+            # if epoch < training_params["encoder_epochs"]:
+            #     loss = 0.0*l["t_predict"] + 0.0*l["p_ce_loss"] + 0.0*l["r_ce_loss"] + 0.0*l["pr_ce_loss"] + l["p_predict"] + l["m_predict"] + l["r_predict"]
+            # else:
 
-            emb = torch.cat((t_emb, p_emb, l_emb, c_emb), 1)
+            loss = l["t_predict"] + l["p_ce_loss"] #+ l["r_ce_loss"] + l["pr_ce_loss"]
 
-            z_rec = decoder(emb)
-            recon_loss = criterion(z, z_rec)
 
-            if epoch > 10:
-                content_enc.train()
-                decoder.train()
-                loss = recon_loss + mfcc_loss + pitch_loss + loudness_loss + commitment_loss + codebook_loss
-                loss.sum().backward()
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            loss.sum().backward()
+            torch.nn.utils.clip_grad_norm_(disentangle.parameters(), 0.0001)
+
+            # if epoch < training_params["encoder_epochs"]:
+            #     feature_optimizer.step()
+            #     feature_optimizer.zero_grad(set_to_none=True)
+            # else:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            # if epoch == training_params["encoder_epochs"]:
+                
+            #     feature_optimizer.step()
+            #     feature_optimizer.zero_grad(set_to_none=True)
+                # disentangle = disentangle.module
+                # disentangle.stop_encoder_training()
+                
+                # for param in disentangle.parameters():
+                #     param.requires_grad = False
+
+                # for param in disentangle.encode_pitch.parameters():
+                #     param.requires_grad = True
+
+                # for param in disentangle.encode_mfcc.parameters():
+                #     param.requires_grad = True
+
+                # for param in disentangle.encode_rms.parameters():
+                #     param.requires_grad = True
+
+                # for param in disentangle.encode_rms.parameters():
+                #     param.requires_grad = True
+
+                # for param in disentangle.decoder.parameters():
+                #     param.requires_grad = True
+
+                # disentangle.pitch_predict.eval()
+                # disentangle.mfcc_predict.eval()
+                # disentangle.rms_predict.eval()
+                # disentangle.dacModel.eval()
+
+                # disentangle = DDP(disentangle, device_ids=[device], output_device=rank, find_unused_parameters=True)
+                # optimizer = optim.Adam( filter(lambda p: p.requires_grad, disentangle.module.parameters()),lr=lr)
             
-            else:
-                loss = mfcc_loss + pitch_loss + loudness_loss
-                loss.sum().backward()
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
 
-            total_train_loss += loss.sum().item()
-            total_recon_loss += recon_loss.item()
-            total_mfcc_loss += mfcc_loss.item()
-            total_pitch_loss += pitch_loss.item()
-            total_loudness_loss += loudness_loss.item()
-            total_commitment_loss += commitment_loss.sum().item()
-            total_codebook_loss += codebook_loss.sum().item()
+            loss_total += loss.item()
+
+            # loss_total_pitch +=  l["p_recon"].item() 
+            # loss_total_mfcc += l["m_recon"].item()
+            # loss_total_rms += l["r_recon"].item()s
+            loss_total_r += l["t_predict"].item()
+            loss_total_ce += (l["p_ce_loss"]).item() #+ l["r_ce_loss"] + l["pr_ce_loss"]).item()
+
+            if training_params["verbos"]:
+                if rank == 0:
+                    print(f"sample {batch_idx + 1} out of {len(train_loader)}")
+                    print(loss.item())
+
+        
+        # scheduler.step()
+        # print(scheduler.get_last_lr())
+        writer.add_scalar("Loss/Total", loss_total / len(train_loader), epoch)
+        writer.add_scalar("Loss/Recon", loss_total_r / len(train_loader), epoch)
+        # writer.add_scalar("Loss/Pitch Predict", loss_total_pitch / len(train_loader), epoch)
+        # writer.add_scalar("Loss/Timbre Predict", loss_total_mfcc / len(train_loader), epoch)
+        # # writer.add_scalar("Loss/Loudness Predict", loss_total_rms / len(train_loader), epoch)
+        # writer.add_scalar("Loss/Pitch Recon", loss_total_pitch / len(train_loader), epoch)
+        # writer.add_scalar("Loss/Timbre Recon", loss_total_mfcc / len(train_loader), epoch)
+        # writer.add_scalar("Loss/Loudness Recon", loss_total_rms / len(train_loader), epoch)
+        writer.add_scalar("Loss/Cosine Embedding", loss_total_ce / len(train_loader), epoch)
+
+        if (epoch % v_frequency) == 0:
+            #evaluate mode
+            disentangle.eval()
 
             if rank == 0:
-                print(f"<======== BATCH {batch_idx+1}/{len(train_loader)} ========>")
-                print("MEMORY_FREE: " + str(torch.cuda.mem_get_info(rank)[0] * 2**(-30)))
-                print("MEMORY_USED: "+ str(torch.cuda.memory_reserved(rank)* 2**(-30)))
-            if rank == 0:
-                print("data loading...")
+                torch.save(disentangle.module, save_path)
 
-        writer.add_scalar("Loss/Total", total_train_loss, epoch)
-        writer.add_scalar("Loss/recon", total_recon_loss, epoch)
-        writer.add_scalar("Loss/mfcc", total_mfcc_loss, epoch)
-        writer.add_scalar("Loss/pitch", total_pitch_loss, epoch)
-        writer.add_scalar("Loss/loudness", total_loudness_loss, epoch)
-        writer.add_scalar("Loss/commitmentl", total_commitment_loss, epoch)
-        writer.add_scalar("Loss/codebook", total_codebook_loss, epoch)
+            v_loss_total = 0
+            # v_loss_total_pitch = 0
+            # v_loss_total_mfcc = 0
+            # v_loss_total_rms = 0
+            v_loss_total_r = 0
+            v_loss_total_ce = 0
 
-        if  epoch % training_params["save_frequency"] == 0:
-            best_train_loss = total_train_loss
-
-            if rank == 0:
-                torch.save(timbre_enc.module, training_params["save_path"] + "_t_enc.pt")
-                torch.save(pitch_enc.module, training_params["save_path"] + "_p_enc.pt")
-                torch.save(loudness_enc.module, training_params["save_path"] + "_l_enc.pt")
-                torch.save(content_enc.module, training_params["save_path"] + "_c_enc.pt")
-                torch.save(decoder.module, training_params["save_path"] + "_dec.pt")
-
-            for i in range(3):
+            i = 0
+            valid_loader.sampler.set_epoch(0)
+            for v_data in valid_loader:
                 #create DAC encoder and decoder
                 model_path = dac.utils.download(model_type="44khz")
                 model = dac.DAC.load(model_path).to(device)
                 model.eval()
 
-                z,mfcc,pyin, rms = next(iter(valid_loader))
+                z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = v_data 
 
                 z = z.to(device)[:,0,:,:]
+                p = p.to(device)
                 mfcc = mfcc.to(device)
-                pyin = pyin.to(device)
                 rms = rms.to(device)
+                inst = inst.to(device)
+                z_prime = z_prime.to(device)[:,0,:,:]
+                p_prime = p_prime.to(device)
+                mfcc_prime = mfcc_prime.to(device)
+                rms_prime = rms_prime.to(device)
+                inst_prime = inst_prime.to(device)
+                l,predict = disentangle(z,p,mfcc,rms,inst,z_prime, p_prime, mfcc_prime, rms_prime, inst_prime)
 
-                c_emb, _, vq_losses = content_enc(z)
-                t_emb = timbre_enc(z)
-                p_emb = pitch_enc(z)
-                l_emb = loudness_enc(z)
+                # v_loss_total_pitch +=  l["p_predict"].item()
+                # v_loss_total_mfcc += l["m_predict"].item()
+                # v_loss_total_rms += l["r_predict"].item()
+                v_loss_total_r += l["t_predict"].item()
+                v_loss_total_ce += (l["p_ce_loss"]).item() #+ l["r_ce_loss"] + l["pr_ce_loss"]).item()
+                v_loss_total = v_loss_total_r + v_loss_total_ce #+ v_loss_total_pitch + v_loss_total_mfcc + v_loss_total_rms 
 
-                emb = torch.cat((t_emb, p_emb, l_emb, c_emb), 1)
-    
-                z_rec = decoder(emb)
+                #make p span across time
+                p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+                p[:,:, ((z.shape[-1]*disentangle.module.pc_num)//disentangle.module.pc_denom):] = torch.tensor(0).to(disentangle.module.device)
 
-                input_audio = model.decode(z)
-                output_audio = model.decode(z_rec)
+                p_prime = p_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+                p_prime[:,:, ((z.shape[-1]*disentangle.module.pc_num)//disentangle.module.pc_denom):] = torch.tensor(0).to(disentangle.module.device)
 
-                writer.add_audio(f"Audio/Input-{i}:"  , input_audio[0])
+                #turn p from midi to hertz
+                p = 440 * 2**((p-69)/12)
+                p_prime = 440 * 2**((p_prime-69)/12)
+                p_hat = 440 * 2**((predict["pitch"]-69)/12)
+
+                
+                z_prime_codes = z_prime
+                z_prime = model.quantizer.from_codes(z_prime_codes[0].unsqueeze(0))[0]
+
+                z_codes = z
+                z = model.quantizer.from_codes(z_codes[0].unsqueeze(0))[0]
+
+                out_codes = predict["z"]
+                out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
+
+                with torch.no_grad():
+                    input_audio = model.decode(z_prime)
+                    output_audio = model.decode(out)
+
+                writer.add_audio(f"Audio/Ground Truth-{i}:"  , input_audio[0])
                 writer.add_audio(f"Audio/Reconstruction-{i}" , output_audio[0])
 
                 samples = input_audio[0][0]
-                pyin =  (pyin * (data.pitch_max - data.pitch_min) - data.pitch_min)[0]
-                p_pred = (p_emb * (data.pitch_max - data.pitch_min) - data.pitch_min)[0]
-                mfcc =  mfcc * (data.mfcc_max - data.mfcc_min) - data.mfcc_min
-                t_pred = (t_emb * (data.pitch_max - data.pitch_min) - data.pitch_min)
+                mfcc =  mfcc_prime * (data.mfcc_max - data.mfcc_min) + data.mfcc_min
+                mfcc_hat = (predict["mfcc"] * (data.mfcc_max - data.mfcc_min) + data.mfcc_min)
 
 
-                writer.add_image(f"Pitch/Input-{i}", make_pyin_img(samples, pyin), dataformats='HWC')
-                writer.add_image(f"Pitch/Reconstruction-{i}", make_pyin_img(samples, p_pred), dataformats='HWC')
+                writer.add_image(f"Pitch/Ground Truth-{i}", make_pitch_img(samples, p_prime[0]), dataformats='HWC')
+                writer.add_image(f"Pitch/Reconstruction-{i}", make_pitch_img(samples, p_hat[0]), dataformats='HWC')
 
-                writer.add_image(f"MFCC/Input-{i}", make_mfcc_img(mfcc), dataformats='HWC')
-                writer.add_image(f"MFCC/Reconstruction-{i}", make_mfcc_img(t_pred), dataformats='HWC')
+                writer.add_image(f"MFCC/Ground Truth-{i}", make_mfcc_img(mfcc), dataformats='HWC')
+                writer.add_image(f"MFCC/Reconstruction-{i}", make_mfcc_img(mfcc_hat), dataformats='HWC')
 
-                writer.add_image(f"RMS/Input-{i}", make_rms_img(rms), dataformats='HWC')
-                writer.add_image(f"RMS/Reconstruction-{i}", make_rms_img(l_emb), dataformats='HWC')
-
-
-
-    torch.cuda.empty_cache()
-
-    for i in range(3):
-        #create DAC encoder and decoder
-        model_path = dac.utils.download(model_type="44khz")
-        model = dac.DAC.load(model_path).to(device)
-        model.eval()
-
-        z,mfcc,pyin, rms = next(iter(valid_loader))
-
-        z = z.to(device)[:,0,:,:]
-        mfcc = mfcc.to(device)
-        pyin = pyin.to(device)
-        rms = rms.to(device)
-
-        c_emb, _, vq_losses = content_enc(z)
-        t_emb = timbre_enc(z)
-        p_emb = pitch_enc(z)
-        l_emb = loudness_enc(z)
-
-        emb = torch.cat((t_emb, p_emb, l_emb, c_emb), 1)
-
-        z_rec = decoder(emb)
-
-        input_audio = model.decode(z_rec)
-        output_audio = model.decode(z_rec)
-
-        writer.add_audio(f"Audio/Input-{i}:"  , input_audio[0])
-        writer.add_audio(f"Audio/Reconstruction-{i}" , output_audio[0])
-
-        samples = input_audio[0][0]
-        pyin =  (pyin * (data.pitch_max - data.pitch_min) - data.pitch_min)[0]
-        p_pred = (p_emb * (data.pitch_max - data.pitch_min) - data.pitch_min)[0]
-        mfcc =  mfcc * (data.mfcc_max - data.mfcc_min) - data.mfcc_min
-        t_pred = (t_emb * (data.pitch_max - data.pitch_min) - data.pitch_min)
-
-
-        writer.add_image(f"Pitch/Input-{i}", make_pyin_img(samples, pyin), dataformats='HWC')
-        writer.add_image(f"Pitch/Reconstruction-{i}", make_pyin_img(samples, p_pred), dataformats='HWC')
-
-        writer.add_image(f"MFCC/Input-{i}", make_mfcc_img(mfcc), dataformats='HWC')
-        writer.add_image(f"MFCC/Reconstruction-{i}", make_mfcc_img(t_pred), dataformats='HWC')
-
-        writer.add_image(f"RMS/Input-{i}", make_rms_img(rms), dataformats='HWC')
-        writer.add_image(f"RMS/Reconstruction-{i}", make_rms_img(l_emb), dataformats='HWC')
+                writer.add_image(f"RMS/Ground Truth-{i}", make_rms_img(rms_prime), dataformats='HWC')
+                writer.add_image(f"RMS/Reconstruction-{i}", make_rms_img(predict["rms"]), dataformats='HWC')
+                if i >2:
+                    break
+                i += 1
             
-    destroy_process_group()
+            writer.add_scalar("Validation Loss/Total", v_loss_total / len(valid_loader), epoch)
+            writer.add_scalar("Validation Loss/Recon", v_loss_total_r / len(valid_loader), epoch)
+            # writer.add_scalar("Validation Loss/Pitch Predict", v_loss_total_pitch / len(valid_loader), epoch)
+            # writer.add_scalar("Validation Loss/Timbre Predict", v_loss_total_mfcc / len(valid_loader), epoch)
+            # writer.add_scalar("Validation Loss/Loudness Predict", v_loss_total_rms / len(valid_loader), epoch)
+            writer.add_scalar("Validation Loss/Cosine Embedding", v_loss_total_ce / len(valid_loader), epoch)
+            
+            #create DAC encoder and decoder
+            model_path = dac.utils.download(model_type="44khz")
+            model = dac.DAC.load(model_path).to(device)
+            model.eval()
+        
+            z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = next(iter(valid_loader))
 
-    # Generate and save reconstructions.
-    # network.eval()
+            z = z.to(device)[:,0,:,:]
+            p = p.to(device)
+            mfcc = mfcc.to(device)
+            rms = rms.to(device)
+            inst = inst.to(device)
+            z_prime = z_prime.to(device)[:,0,:,:]
+            p_prime = p_prime.to(device)
+            mfcc_prime = mfcc_prime.to(device)
+            rms_prime = rms_prime.to(device)
+            inst_prime = inst_prime.to(device)
+            _,predict = disentangle(z,p,mfcc,rms,inst,z_prime, p_prime, mfcc_prime, rms_prime, inst_prime)
+            
+            z_hat = predict["z"]
 
-    # audio = next(iter(train_loader))
-    # out = network(audio[0].to(device))
+            #convert from discrete code to continuous embedding
+            z_codes = z
+            z = model.quantizer.from_codes(z)[0]
 
-    # writer.add_audio("Input Audio "  , audio[0][0], 0, 16000)
-    # writer.add_audio("Reconstuction " , out["x_recon"][0], 0, 16000)
+
+            input_audio = model.decode(z[0].unsqueeze(0))
+            writer.add_audio(f"Audio/Input:"  , input_audio[0])
+
+            pitches = torch.tensor([num for num in [61, 56, 26, 35]]).to(device)
+            
+            for i in range(4):
+                z_predict = disentangle.module.get_new_sample(z_codes[0].unsqueeze(0), pitches[i].unsqueeze(0), p_start=p[0].unsqueeze(0), mfcc=mfcc[0].unsqueeze(0), rms=rms[0].unsqueeze(0), inst=inst[0].unsqueeze(0))
+                z_predict = model.quantizer.from_codes(z_predict)[0]
+                out = model.decode(z_predict)
+
+                # writer.add_audio(f"Audio/Output-{i}:"  , out[0])
+                writer.add_audio(f"Audio/Predict: pitch = {pitches[i]}" , out[0])
+
+            # l_curve1 = torch.arange(0,1,1/z.shape[-1])
+            # l_curve2 = torch.arange(1,0,1/-z.shape[-1])
+            # l_curve3 = torch.cat((torch.arange(0,1,1/(z.shape[-1]/2)), torch.arange(1,0,-1/(z.shape[-1]/2))))[:z.shape[-1]]
+            # l_curve4 = torch.cat((torch.arange(0,1,1/(3*z.shape[-1]/4)), torch.arange(1,0,-1/(z.shape[-1]/4))))[:z.shape[-1]]
+
+            # curves = [l_curve1, l_curve2, l_curve3,l_curve4]
+            # for i in range(4):
+            #     z_predict = disentangle.module.get_new_sample(z_codes[0].unsqueeze(0), rms=curves[i].unsqueeze(0).unsqueeze(0).to(device), mfcc=mfcc[0].unsqueeze(0), p=p[0].unsqueeze(0))
+            #     z_predict = model.quantizer.from_codes(z_predict)[0]
+            #     out = model.decode(z_predict)
+
+            #     # writer.add_audio(f"Audio/Output-{i}:"  , out[0])
+            #     writer.add_audio(f"Audio/Predict: loudness = curve {i+1}" , out[0])
+
+            # total_mi_score = 0
+            # for (batch_idx, valid_tensors) in enumerate(valid_loader):
+            #     z,p,z_prime,p_prime = train_tensors
+
+            #     z = z.to(device)[:,0,:,:]
+            #     p = p.to(device)
+            #     z_prime = z_prime.to(device)[:,0,:,:]
+            #     p_prime = p_prime.to(device)
+
+            #     _,_,_ = disentangle(z,p,z_prime,p_prime)
+
+            #     pe = disentangle.module.pitch_emb
+            #     re = disentangle.module.rest_emb
+
+
+            #     mi_score = MutualInfoScore()
+            #     total_mi_score += mi_score
+            #     score = mi_score(torch.flatten(pe.int()),torch.flatten(re.int()))
+
+            # writer.add_scalar("Metric/Mutal Information P and R", total_mi_score.compute() / len(valid_loader), epoch)
+
+        
+    ddp_cleanup()
+    # #evaluate mode
+    # disentangle.eval()
+
+    # #create DAC encoder and decoder
+    # model_path = dac.utils.download(model_type="44khz")
+    # model = dac.DAC.load(model_path).to(device)
+    # model.eval()
+
+    # z,p,mfcc,rms,z_prime = next(iter(train_loader))
+
+    # z = z.to(device)[:,0,:,:]
+    # p = p.to(device)
+    # mfcc = mfcc.to(device)
+    # z_prime = z_prime.to(device)[:,0,:,:]
+
+    # _,predict = disentangle(z,p,mfcc, rms,z_prime)
+    
+    # z_hat = predict["z"]
+
+    # #convert from discrete code to continuous embedding
+    # z_codes = z
+    # z = model.quantizer.from_codes(z)[0]
+
+
+    # input_audio = model.decode(z[0].unsqueeze(0))
+    # writer.add_audio(f"Audio/Input:"  , input_audio[0])
+
+    # pitches = torch.tensor([num for num in [61, 56, 26, 26, 35]]).to(device)
+    # for i in range(5):
+    #     z_predict = disentangle.module.get_new_sample(z_codes[0].unsqueeze(0), pitches[i].unsqueeze(0))
+    #     z_predict = model.quantizer.from_codes(z_predict)[0]
+    #     out = model.decode(z_predict)
+
+    #     # writer.add_audio(f"Audio/Output-{i}:"  , out[0])
+    #     writer.add_audio(f"Audio/Predict: pitch = {pitches[i]}" , out[0])
+
+    # pitches = [torch.tensor(num).to(device).unsqueeze(0) for num in [61, 56, 26, 26, 35]]
+    # for i in range(5):
+    #     # zin = (zin * (data.z_max - data.z_min) + data.z_min)
+    #     # z_prime[i] = (z_prime[i] * (data.z_max - data.z_min) + data.z_min)
+    #     # z_prime_hat[i] = (z_prime_hat[i] * (data.z_max - data.z_min) + data.z_min)
+
+    #     # input_audio = model.decode(z[i].unsqueeze(0))
+    #     # ground_truth_audio = model.decode(z_prime[i].unsqueeze(0))
+    #     if i == 4:
+    #         z_predict = disentangle.module(z_codes[i].unsqueeze(0), p[i].unsqueeze(0),z_codes[i].unsqueeze(0), p[i].unsqueeze(0))[3]
+
+    #     else:
+    #         z_predict = disentangle.module.get_new_pitch(z_codes[0].unsqueeze(0), pitches[i])
+    #     # z_predict = model.quantizer.from_codes(z_predict)[0]
+    #     predict_audio = model.decode(z_predict)
+
+    #     # writer.add_audio(f"Audio/Input-{i}:"  , input_audio[0])
+    #     # writer.add_audio(f"Audio/Ground Truth-{i}" , ground_truth_audio[0])
+    #     writer.add_audio(f"Audio/Predict: pitch = {pitches[i][0]}" , predict_audio[0])
 
     writer.flush()
     writer.close()
+
+
+
+
+
+
+
+
+    # # Train model.
+    # eval_every = 1
+    # best_train_loss = float("inf")
+    # timbre_enc.train()
+    # pitch_enc.train()
+    # loudness_enc.train()
+    # content_enc.train()
+    # decoder.train()
+
+
+
 
 
 if __name__ == "__main__":
