@@ -144,8 +144,10 @@ def main(rank, world_size):
     
     
     #optimizer for feature vectors
-    feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name ], lr=lr)
-    enc_parameters = [name for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name ]
+    feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name and "dacModel" not in name], lr=lr)
+    enc_parameters = [name for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name in name and "dacModel" not in name]
+
+
     #add learning rate decay
     # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, gamma=0.99)
 
@@ -158,7 +160,7 @@ def main(rank, world_size):
         disentangle.load_state_dict(old_model.state_dict())
         disentangle = DDP(disentangle, device_ids=[device], output_device=rank, find_unused_parameters=True)
         optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" not in name and "mfcc_predict" not in name and "rms_predict" not in name and "dacModel" not in name], lr=lr)
-        feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name ], lr=lr)
+        feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name and "dacModel" not in name], lr=lr)
         torch.distributed.barrier()
 
     if training_params["train_encoder"]:
@@ -167,26 +169,29 @@ def main(rank, world_size):
             disentangle.train()
             train_loader.sampler.set_epoch(epoch)
 
+            loss_total_r = 0
             loss_total_pitch = 0
             loss_total_mfcc = 0
             loss_total_rms = 0
 
             for (batch_idx, train_tensors) in enumerate(train_loader):
-                z,p,mfcc,rms,z_prime,p_prime,mfcc_prime,rms_prime = train_tensors   
+                z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = train_tensors   
 
                 z = z.to(device)[:,0,:,:]
                 p = p.to(device)
                 mfcc = mfcc.to(device)
                 rms = rms.to(device)
+                inst = inst.to(device)
                 l,_ = disentangle.module.train_enc(z,p,mfcc, rms)
 
-                loss = l["p_predict"] + l["m_predict"] + l["r_predict"]
+                loss = l["t_predict"] + l["p_predict"] + l["m_predict"] + l["r_predict"]
                 loss.sum().backward()
                 torch.nn.utils.clip_grad_norm_(disentangle.parameters(), 0.0001)
 
                 feature_optimizer.step()
                 feature_optimizer.zero_grad(set_to_none=True)
 
+                loss_total_r += l["t_predict"].item()
                 loss_total_pitch +=  l["p_predict"].item() 
                 loss_total_mfcc += l["m_predict"].item()
                 loss_total_rms += l["r_predict"].item()
@@ -196,6 +201,7 @@ def main(rank, world_size):
                         print(f"sample {batch_idx + 1} out of {len(train_loader)}")
                         print(loss.item())
             
+            writer.add_scalar("Encoder Loss/Reconstruct", loss_total_r / len(train_loader), epoch)
             writer.add_scalar("Encoder Loss/Pitch Predict", loss_total_pitch / len(train_loader), epoch)
             writer.add_scalar("Encoder Loss/Timbre Predict", loss_total_mfcc / len(train_loader), epoch)
             writer.add_scalar("Encoder Loss/Loudness Predict", loss_total_rms / len(train_loader), epoch)
@@ -205,9 +211,11 @@ def main(rank, world_size):
         disentangle.pitch_predict.load_state_dict(old_model.pitch_predict.state_dict())
         disentangle.mfcc_predict.load_state_dict(old_model.mfcc_predict.state_dict())
         disentangle.rms_predict.load_state_dict(old_model.rms_predict.state_dict())
+        disentangle.encode_rest.load_state_dict(old_model.encode_rest.state_dict())
+        disentangle.decoder.load_state_dict(old_model.decoder.state_dict())
         disentangle = DDP(disentangle, device_ids=[device], output_device=rank, find_unused_parameters=True)
         optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" not in name and "mfcc_predict" not in name and "rms_predict" not in name and "dacModel" not in name], lr=lr)
-        feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name ], lr=lr)
+        feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name and "dacModel" not in name], lr=lr)
         torch.distributed.barrier()
 
     # epochs = training_params["epochs"]
