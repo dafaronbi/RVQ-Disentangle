@@ -21,6 +21,129 @@ from torch import nn
 from custom_layers import nn_custom, vq_custom
 import dac
 
+class new_model(nn.Module):
+    def __init__(self, device):
+        super().__init__()
+
+        self.device = device
+        self.emb_dim = 32
+
+        model_path = dac.utils.download(model_type="44khz") 
+        self.dacModel = dac.DAC.load(model_path)
+        self.dacModel.eval()
+
+        self.enc = nn.Sequential(
+            nn.Conv1d(in_channels=1024, out_channels=32, kernel_size=8, stride=2, padding=0, dilation=1),
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=8, stride=2, padding=0, dilation=1),
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=8, stride=2, padding=0, dilation=1),
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=7, stride=1, padding=3, dilation=1),
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            )
+
+        self.p_enc = nn.Sequential(
+            nn.Conv1d(in_channels=1, out_channels=32, kernel_size=5, stride=1, padding=2, dilation=1),
+            nn_custom.ResidualWrapper(
+            nn.Sequential(
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(),
+        )),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(),
+        )
+
+        self.dec = nn.Sequential(
+            nn.ConvTranspose1d(in_channels=self.emb_dim, out_channels=32, kernel_size=8, stride=2, padding=0, dilation=1),
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=32, out_channels=32, kernel_size=8, stride=2, padding=0, dilation=1),
+            nn.SyncBatchNorm(32),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=7, stride=1, padding=3, dilation=1),
+            nn.SyncBatchNorm(64),
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=64, out_channels=128, kernel_size=8, stride=2, padding=0, dilation=1),
+            nn.SyncBatchNorm(128),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=128, out_channels=256, kernel_size=7, stride=1, padding=6, dilation=1),
+            nn.SyncBatchNorm(256),
+            nn.ReLU(),
+            nn_custom.SwapAxes((1,2)),
+            nn.Linear(256,1024*9),
+            nn_custom.SwapAxes((1,2)),
+            nn.Unflatten(1, (1024,9)),
+            nn.LogSoftmax(dim=1),
+            )
+    
+    def forward(self, z,p, z_prime,p_prime):
+        
+        #convert codes to embedding dimensions
+        z_codes = z
+        with torch.no_grad():
+            z = self.dacModel.quantizer.from_codes(z)[0]
+
+        z_prime_codes = z_prime
+        with torch.no_grad():
+            z_prime = self.dacModel.quantizer.from_codes(z_prime)[0]
+
+        #get latent from audio input
+        latent = self.enc(z.float())
+
+        #extend the length of pitch to be size of latent space
+        p = p.unsqueeze(1).expand(-1, latent.shape[-1]).unsqueeze(1).float()
+        p_prime = p_prime.unsqueeze(1).expand(-1, latent.shape[-1]).unsqueeze(1).float()
+
+        #get pitch embeddings
+        p_latent = self.p_enc(p)
+        p_prime_latent = self.p_enc(p_prime)
+
+        #reconstruct new pitch signal
+        z_hat = self.dec(latent - p_latent + p_prime_latent)
+        
+
+        #loss categorical and regression loss functions
+        C_loss = nn.NLLLoss(reduction='none')
+
+        token_predict_loss = C_loss(z_hat, z_prime_codes)
+
+        #weight the loss per hierarchical token
+        token_predict_loss *= torch.linspace(1,0.1,9).to(self.device)[None, :, None]
+        token_predict_loss = token_predict_loss.mean()
+
+
+
+
+        z_hat = torch.argmax(z_hat, dim=1)
+
+
+        loss = {"t_predict": token_predict_loss,
+                }
+
+        predict = {"z" : z_hat,
+        }
+
+        return loss, predict
+
+
 
 class disentangle(nn.Module):
     def __init__(self, device=None):
@@ -36,11 +159,11 @@ class disentangle(nn.Module):
         self.pc_num = 3
         self.pc_denom = 4
 
-        self.emb_dim = 1024
+        self.emb_dim = 32
 
-        model_path = dac.utils.download(model_type="44khz") 
-        self.dacModel = dac.DAC.load(model_path)
-        self.dacModel.eval()
+        # model_path = dac.utils.download(model_type="44khz") 
+        # self.dacModel = dac.DAC.load(model_path)
+        # self.dacModel.eval()
 
         self.pitch_predict = nn.Sequential(
             nn.Conv1d(in_channels=1024, out_channels=256, kernel_size=3, stride=1, padding=1, dilation=1),
@@ -50,7 +173,7 @@ class disentangle(nn.Module):
             nn.ReLU(),
             nn.Conv1d(in_channels=256, out_channels=256, kernel_size=3, stride=1, padding=3, dilation=3),
         )),
-        nn.Conv1d(in_channels=256, out_channels=32, kernel_size=3, stride=1, padding=6, dilation=6),
+        nn.Conv1d(in_channels=256, out_channels=32, kernel_size=3, stride=1, padding=6,  dilation=6),
         nn.SyncBatchNorm(32),
         nn.ReLU(),
         nn.Conv1d(in_channels=32, out_channels=128, kernel_size=3, stride=1, padding=9, dilation=9),
@@ -137,60 +260,126 @@ class disentangle(nn.Module):
         )
 
         self.encode_rest = nn.Sequential(
-            nn.Conv1d(in_channels=1024, out_channels=256, kernel_size=5, stride=1, padding=2, dilation=1),
-            nn_custom.ResidualWrapper(
-            nn.Sequential(
-            nn.SyncBatchNorm(256),
+            # nn.Conv1d(in_channels=9, out_channels=32, kernel_size=5, stride=1, padding=2, dilation=1),
+            # nn.SyncBatchNorm(32),
+            # nn.ReLU(),
+            # nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=6, dilation=3),
+            # nn.SyncBatchNorm(32),
+            # nn.ReLU(),
+            # nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=18, dilation=9),
+            # nn.SyncBatchNorm(32),
+            # nn.ReLU(),
+            # nn.Conv1d(in_channels=32, out_channels=32, kernel_size=6, stride=2, padding=0, dilation=1),
+            # nn.SyncBatchNorm(32),
+            # nn.ReLU(),
+            # nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=2, dilation=1),
+            # nn.SyncBatchNorm(32),
+            # nn.ReLU(),
+            # nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=6, dilation=3),
+            # nn.SyncBatchNorm(32),
+            # nn.ReLU(),
+            # nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=18, dilation=9),
+            # nn.SyncBatchNorm(32),
+            # nn.ReLU(),
+            # nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=6, stride=4, padding=0, dilation=1),
+            # nn.ReLU(),
+            nn.Conv1d(in_channels=9, out_channels=32, kernel_size=5, stride=1, dilation=1),
+            # nn_custom.ResidualWrapper(
+            # nn.Sequential(
+            nn.SyncBatchNorm(32),
             nn.ReLU(),
-            nn.Conv1d(in_channels=256, out_channels=256, kernel_size=3, stride=1, padding=3, dilation=3),
-        )),
-        nn.Conv1d(in_channels=256, out_channels=32, kernel_size=3, stride=1, padding=6, dilation=6),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=3, stride=1, dilation=3),
+            nn.ReLU(),
+        # )
+        # ),
+        nn.Conv1d(in_channels=32, out_channels=32, kernel_size=3, stride=1, dilation=6),
         nn.SyncBatchNorm(32),
         nn.ReLU(),
-        nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=3, stride=1, padding=9, dilation=9),
+        nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=6, stride=3, dilation=1),
+        nn.ReLU(),
+        nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=5, stride=1, padding=2, dilation=1),
         nn.ReLU()
             )
 
         # self.rest_transform =nn.Conv1d(in_channels=self.emb_dim+1, out_channels=self.emb_dim, kernel_size=5, stride=1, padding=2, dilation=1)
 
+        # self.decoder = nn.Sequential(
+        #     nn.ConvTranspose1d(in_channels=self.emb_dim, out_channels=64, kernel_size=6, stride=4, padding=0, dilation=1),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2, dilation=1),
+        #     nn.SyncBatchNorm(128),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=128, out_channels=256, kernel_size=5, stride=1, padding=6, dilation=3),
+        #     nn.SyncBatchNorm(256),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=256, out_channels=256, kernel_size=5, stride=1, padding=18, dilation=9),
+        #     nn.SyncBatchNorm(256),
+        #     nn.ReLU(),
+        #     nn.ConvTranspose1d(in_channels=256, out_channels=256, kernel_size=6, stride=2, padding=0, dilation=1),
+        #     nn.SyncBatchNorm(256),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=256, out_channels=256, kernel_size=5, stride=1, padding=2, dilation=1),
+        #     nn.SyncBatchNorm(256),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=256, out_channels=256, kernel_size=5, stride=1, padding=6, dilation=3),
+        #     nn.SyncBatchNorm(256),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=256, out_channels=256, kernel_size=5, stride=1, padding=18, dilation=9),
+        #     nn.SyncBatchNorm(256),
+        #     nn.ReLU(),
+        #     nn.Conv1d(256, 1024*9, kernel_size=7, stride=1, padding=3, dilation=1),
+        #     nn.Unflatten(1, (1024,9)),
+        #     nn.LogSoftmax(dim=1),
+        #     )
         self.decoder = nn.Sequential(
                 nn.SyncBatchNorm(self.emb_dim),
-                nn.ConvTranspose1d(self.emb_dim, 256, 3, 1, 1, dilation=1),
-                nn_custom.ResidualWrapper(
-                    nn.Sequential(
-                    nn.SyncBatchNorm(256),
-                    nn.ReLU(),
-                    nn.ConvTranspose1d(256, 256, 7, 1, 9, dilation=3),
-                    nn.ReLU(),
-                )
-                ),
-                nn_custom.ResidualWrapper(
-                    nn.Sequential(
-                    nn.SyncBatchNorm(256),
-                    nn.ReLU(),
-                    nn.ConvTranspose1d(256, 256,7, 1, 18, dilation=6),
-                    nn.ReLU(),
-                ),
-                ),
-                # nn_custom.ResidualWrapper(
-                    nn.Sequential(
-                    nn.SyncBatchNorm(256),
-                    nn.ReLU(),
-                    nn.ConvTranspose1d(256, 512,7, 1, 27, dilation=9),
-                    nn.ReLU(),
-                ),
-                # ),
-                # nn_custom.ResidualWrapper(
-                    nn.Sequential(
-                    nn.SyncBatchNorm(512),
-                    nn.ReLU(),
-                    nn.ConvTranspose1d(512, 1024,7, 1, 36, dilation=12),
-                    nn.ReLU(),
-                ),
-                # ),
-                nn_custom.GRUWrap(1024,1024,1, batch_first=True),
+                nn.ConvTranspose1d(self.emb_dim, 32, kernel_size=3, stride=3, padding=1, dilation=1),
                 nn.ReLU(),
-                nn.ConvTranspose1d(1024, 1024*9, kernel_size=7, stride=1, padding=45, dilation=15),
+                nn.ReLU(),
+                # nn_custom.ResidualWrapper(
+                    nn.Sequential(
+                    nn.SyncBatchNorm(32),
+                    nn.ReLU(),
+                    nn.ConvTranspose1d(32, 64, kernel_size=7, stride=1, padding=9, dilation=3),
+                    nn.ReLU(),
+                ),
+                # ),
+                # nn_custom.ResidualWrapper(
+                    nn.Sequential(
+                    nn.SyncBatchNorm(64),
+                    nn.ReLU(),
+                    nn.ConvTranspose1d(64, 128,kernel_size=7, stride=1, padding=18, dilation=6),
+                    nn.ReLU(),
+                ),
+                # ),
+                # nn_custom.ResidualWrapper(
+                    nn.Sequential(
+                    nn.SyncBatchNorm(128),
+                    nn.ReLU(),
+                    nn.ConvTranspose1d(128, 256, kernel_size=7, stride=1, padding=27, dilation=9),
+                    nn.ReLU(),
+                ),
+                # ),
+                # # nn_custom.ResidualWrapper(
+                    nn.Sequential(
+                    nn.SyncBatchNorm(256),
+                    nn.ReLU(),
+                    nn.ConvTranspose1d(256, 256,kernel_size=7, stride=1, padding=36,dilation=12),
+                    nn.ReLU(),
+                ),
+                # ),
+                nn_custom.GRUWrap(256,256,1, batch_first=True),
+                # nn.ReLU(),
+                # nn.ConvTranspose1d(256, 256, kernel_size=7, stride=1,  padding=3, dilation=1),
+                # nn.ReLU(),
+                # nn.ConvTranspose1d(256, 256, kernel_size=7, stride=1,  padding=3, dilation=1),
+                # nn.ReLU(),
+                nn.ConvTranspose1d(256, 256, kernel_size=7, stride=1,  padding=31, dilation=15),
+                nn.ReLU(),
+                # nn.ConvTranspose1d(1024, 1024*9, kernel_size=1, stride=1, padding=0, dilation=1),
+                nn_custom.SwapAxes((1,2)),
+                nn.Linear(256,1024*9),
+                nn_custom.SwapAxes((1,2)),
                 nn.Unflatten(1, (1024,9)),
                 nn.LogSoftmax(dim=1),
                 # nn.SyncBatchNorm(1024),
@@ -214,7 +403,7 @@ class disentangle(nn.Module):
     def get_new_sample(self, z, p=None, p_start=None, mfcc=None, rms=None, inst=None):
         #get z input in coninous mode
         z_codes = z
-        z = self.dacModel.quantizer.from_codes(z)[0]
+        # z = self.dacModel.quantizer.from_codes(z)[0]
 
         # p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
         # p[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
@@ -230,62 +419,65 @@ class disentangle(nn.Module):
          #Convert from probability vector to single value with argmax
         # z_hat = torch.argmax(z_hat, dim=1)
 
-        #predict pitch
-        p_predict = self.pitch_predict(z)
-        p_predict = torch.argmax(p_predict, dim=1).float().unsqueeze(1)
+        # #predict pitch
+        # p_predict = self.pitch_predict(z)
+        # p_predict = torch.argmax(p_predict, dim=1).float().unsqueeze(1)
 
-        #predict mfcc 
-        m_predict = self.mfcc_predict(z)
+        # #predict mfcc 
+        # m_predict = self.mfcc_predict(z)
 
-        # #predict rms
-        r_predict = self.rms_predict(z)
+        # # #predict rms
+        # r_predict = self.rms_predict(z)
 
-
-        if mfcc != None:
-            mfcc = mfcc[..., :z.shape[-1]]
-        
-        if rms != None:
-            rms = rms[..., :z.shape[-1]]
-
-        if p != None:
-            p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
-            # p[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
-            p_embedding = self.encode_pitch(p)
-        else:
-            p_embedding = self.encode_pitch(p_predict)
 
         # if mfcc != None:
-        #     m_embedding = self.encode_mfcc(mfcc)
-        # else:
-        #     m_embedding = self.encode_mfcc(m_predict)
-        #     mfcc = m_predict
-
-        if rms != None:
-            r_embedding = self.encode_rms(rms)
-        else:
-            r_embedding = self.encode_rms(r_predict)
+        #     mfcc = mfcc[..., :z.shape[-1]]
+        
+        # if rms != None:
+        #     rms = rms[..., :z.shape[-1]]
 
         # if p != None:
-        #     p_predict = p
+        #     p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        #     # p[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
+        #     p_embedding = self.encode_pitch(p)
+        # else:
+        #     p_embedding = self.encode_pitch(p_predict)
 
-        # if mfcc != None:
-        #     m_predict = mfcc
+        # # if mfcc != None:
+        # #     m_embedding = self.encode_mfcc(mfcc)
+        # # else:
+        # #     m_embedding = self.encode_mfcc(m_predict)
+        # #     mfcc = m_predict
 
         # if rms != None:
-        #     r_predict = rms
+        #     r_embedding = self.encode_rms(rms)
+        # else:
+        #     r_embedding = self.encode_rms(r_predict)
 
-        if inst != None:
-            inst = inst.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
-            m_embedding = self.encode_mfcc(inst)
-        else:
-            inst = torch.tensor([759]).to(self.device)
-            inst = i_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
-            m_embedding = self.encode_mfcc(inst)
+        # # if p != None:
+        # #     p_predict = p
+
+        # # if mfcc != None:
+        # #     m_predict = mfcc
+
+        # # if rms != None:
+        # #     r_predict = rms
+
+        # if inst != None:
+        #     inst = inst.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        #     m_embedding = self.encode_mfcc(inst)
+        # else:
+        #     inst = torch.tensor([759]).to(self.device)
+        #     inst = i_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        #     m_embedding = self.encode_mfcc(inst)
 
         #get the rest embedding form the rest encoder (should learn to subtract pitch)
-        rest_embedding = self.encode_rest(z)
-        p_start = p_start.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        rest_embedding = self.encode_rest(z.float())
+        
+        p_start = p_start.unsqueeze(1).expand(-1, rest_embedding.shape[-1]).unsqueeze(1).float()
         p_start_embedding = self.encode_pitch(p_start)
+        p = p.unsqueeze(1).expand(-1, rest_embedding.shape[-1]).unsqueeze(1).float()
+        p_embedding = self.encode_pitch(p)
         rest_embedding =  rest_embedding - p_start_embedding
 
         #make predicted pitch higher dimmensional for loss
@@ -307,8 +499,8 @@ class disentangle(nn.Module):
     def train_enc(self, z, p, mfcc, rms):
         #get z input in coninuous mode
         z_codes = z
-        with torch.no_grad():
-            z = self.dacModel.quantizer.from_codes(z)[0]
+        # with torch.no_grad():
+        #     z = self.dacModel.quantizer.from_codes(z)[0]
 
         #loss categorical and regression loss functions
         C_loss = nn.NLLLoss()
@@ -323,6 +515,12 @@ class disentangle(nn.Module):
         # #predict rms
         r_predict = self.rms_predict(z)
 
+        z_hat = self.decoder(self.encode_rest(z))
+
+        #get loss of predicting token
+        token_predict_loss = C_loss(z_hat, z_codes)
+        z_hat = torch.argmax(z_hat, dim=1)
+
         p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
         p[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
 
@@ -333,12 +531,14 @@ class disentangle(nn.Module):
         mfcc_predict_loss = MSE_loss(m_predict, mfcc)
         rms_predict_loss = MSE_loss(r_predict, rms)
 
-        loss = {"p_predict": pitch_predict_loss,
+        loss = {"t_predict": token_predict_loss,
+                "p_predict": pitch_predict_loss,
                 "m_predict": mfcc_predict_loss,
                 "r_predict": rms_predict_loss,
                 }
 
-        predict = {"pitch" : p_predict,
+        predict = { "z" : z_hat,
+                    "pitch" : p_predict,
                     "mfcc" : m_predict,
                     "rms" : r_predict
         }
@@ -348,8 +548,8 @@ class disentangle(nn.Module):
     def train_recon(self, z,  z_prime, p_prime,mfcc_prime, rms_prime):
         #get z input in coninuous mode
         z_codes = z
-        with torch.no_grad():
-            z = self.dacModel.quantizer.from_codes(z)[0]
+        # with torch.no_grad():
+        #     z = self.dacModel.quantizer.from_codes(z)[0]
         
 
         #get z_prime in continuous mode
@@ -414,8 +614,160 @@ class disentangle(nn.Module):
 
         return loss,predict
 
+    def train_autoencoder(self, z):
+        #get z input in coninuous mode
+        z_codes = z
+        # with torch.no_grad():
+        #     z = self.dacModel.quantizer.from_codes(z)[0]
+        
 
-    def forward(self, z, p, mfcc, rms, inst, z_prime, p_prime,mfcc_prime, rms_prime, inst_prime):
+        #loss categorical and regression loss functions
+        C_loss = nn.NLLLoss()
+        
+
+        #get the rest embedding form the rest encoder (should learn to subtract pitch)
+        latent = self.encode_rest(z.float()) 
+
+        #decode back to z
+        z_hat = self.decoder(latent)
+
+        #get loss of predicting token
+        token_predict_loss = C_loss(z_hat, z_codes)
+
+        loss = {"t_predict": token_predict_loss}
+
+        predict = {"z" : z_hat}
+
+        return loss,predict
+
+
+    # def forward(self, z, p, mfcc, rms, inst, z_prime, p_prime,mfcc_prime, rms_prime, inst_prime):
+        
+    #     #get z input in coninuous mode
+    #     z_codes = z
+    #     with torch.no_grad():
+    #         z = self.dacModel.quantizer.from_codes(z)[0]
+        
+
+    #     #get z_prime in continuous mode
+    #     z_prime_codes = z_prime
+    #     with torch.no_grad():
+    #         z_prime = self.dacModel.quantizer.from_codes(z_prime)[0]
+        
+    #     #loss categorical and regression loss functions
+    #     C_loss = nn.NLLLoss()
+    #     MSE_loss = nn.MSELoss()
+    #     COS_loss = nn.CosineEmbeddingLoss()
+
+    #     #predict pitch
+    #     # p_predict = self.pitch_predict(z_prime)
+    #     # p_predict = torch.argmax(p_predict, dim=1).float().unsqueeze(1)
+
+    #     # #predict mfcc 
+    #     # m_predict = self.mfcc_predict(z_prime)
+
+    #     # #predict rms
+    #     # r_predict = self.rms_predict(z_prime)
+ 
+    #     p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+    #     # p[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
+    #     p_prime = p_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+    #     # p_prime[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
+    #     mfcc = mfcc[..., :z.shape[-1]]
+    #     mfcc_prime = mfcc_prime[..., :z.shape[-1]]
+    #     rms = rms[..., :z.shape[-1]]
+    #     rms_prime = rms_prime[..., :z.shape[-1]]
+    #     # inst = inst.unsqueeze(1).expand(-1, rest_embedding.shape[-1]).unsqueeze(1).float()
+    #     # inst_prime = inst_prime.unsqueeze(1).expand(-1, rest_embedding.shape[-1]).unsqueeze(1).float()
+
+    #     # recon_loss = MSE_loss(z_prime, z_prime_hat)
+    #     #get loss of pitch prediction
+    #     # pitch_predict_loss = C_loss(p_predict, p[:,0,:].long())
+    #     # mfcc_predict_loss = MSE_loss(m_predict, mfcc)
+    #     # rms_predict_loss = MSE_loss(r_predict, rms)
+        
+
+    #     # p_prime = p_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+    #     # p_prime[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
+
+    #     #get pitch embeding from pitch encoder
+    #     # p_embedding = self.encode_pitch(torch.argmax(p_prime, dim=1).float().unsqueeze(1))
+
+
+    #     p_embedding = self.encode_pitch(p)
+    #     # r_embedding = self.encode_rms(rms)
+    #     # m_embedding = self.encode_mfcc(inst)
+    #     p_embedding_prime = self.encode_pitch(p_prime)
+    #     # r_embedding_prime = self.encode_rms(rms_prime)
+    #     # m_embedding_prime = self.encode_mfcc(inst_prime)
+        
+
+    #     #get the rest embedding form the rest encoder (should learn to subtract pitch)
+
+    #     rest_embedding = self.encode_rest(z)
+    #     rest_embedding =  rest_embedding - p_embedding
+
+
+    #     #make predicted pitch higher dimmensional for loss
+    #     # p_embedding = torch.zeros(rest_embedding.shape).to(self.device)
+    #     # p_embedding[:, 0,:] = torch.argmax(p_prime, dim=1)
+    #     # p_embedding[:, 0,:] = p_prime[:,0,:]
+
+    #     #put embeddings into class public class attributes for access in computing metrics
+    #     self.pitch_emb = p_embedding
+    #     self.rest_emb = rest_embedding
+
+    #     #decode back to z
+    #     z_hat = self.decoder(p_embedding_prime +  rest_embedding)#self.decoder(torch.cat((p_predict, m_predict, r_predict), dim=1)) 
+
+
+    #     #get loss of predicting token
+    #     token_predict_loss = C_loss(z_hat, z_prime_codes)
+
+    #     #get loss of embedding similarity
+    #     # pitch_ce_loss = COS_loss(p_embedding.view(z.shape[0], p_embedding.shape[1]*p_embedding.shape[2]), rest_embedding.view(z.shape[0], rest_embedding.shape[1]*rest_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
+    #     # mfcc_ce_loss = COS_loss(m_embedding.view(z.shape[0], m_embedding.shape[1]*m_embedding.shape[2]), rest_embedding.view(z.shape[0], rest_embedding.shape[1]*rest_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
+    #     # rms_ce_loss = COS_loss(r_embedding.view(z.shape[0], r_embedding.shape[1]*r_embedding.shape[2]), rest_embedding.view(z.shape[0], rest_embedding.shape[1]*rest_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
+    #     # pm_ce_loss = COS_loss(p_embedding.view(z.shape[0], p_embedding.shape[1]*p_embedding.shape[2]), m_embedding.view(z.shape[0], m_embedding.shape[1]*m_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
+    #     # pr_ce_loss = COS_loss(p_embedding.view(z.shape[0], p_embedding.shape[1]*p_embedding.shape[2]), r_embedding.view(z.shape[0], r_embedding.shape[1]*r_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
+    #     # mr_ce_loss = COS_loss(m_embedding.view(z.shape[0], m_embedding.shape[1]*m_embedding.shape[2]), r_embedding.view(z.shape[0], r_embedding.shape[1]*r_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
+
+    #     #Convert from probability vector to single value with argmax
+    #     z_hat = torch.argmax(z_hat, dim=1)
+    #     # z_hat_con = self.dacModel.quantizer.from_codes(z_hat)[0]
+
+    #     # recon_pitch = self.pitch_predict(z_hat_con)
+    #     # recon_mfcc = self.mfcc_predict(z_hat_con)
+    #     # recon_rms = self.rms_predict(z_hat_con)
+
+    #     # pitch_predict_loss = C_loss(recon_pitch, p_prime[:,0,:].long())
+    #     # mfcc_predict_loss = MSE_loss(recon_mfcc, mfcc_prime)
+    #     # rms_predict_loss = MSE_loss(recon_rms, rms_prime)
+
+    #     loss = {"t_predict": token_predict_loss,
+    #             # "p_recon": pitch_predict_loss,
+    #             # "m_recon": mfcc_predict_loss,
+    #             # "r_recon": rms_predict_loss,
+    #             # "p_ce_loss": pitch_ce_loss,
+    #             # "m_ce_loss": mfcc_ce_loss,
+    #             # "r_ce_loss": rms_ce_loss,
+    #             # "pm_ce_loss": pm_ce_loss,
+    #             # "pr_ce_loss": pr_ce_loss,
+    #             # "mr_ce_loss": mr_ce_loss,
+    #             }
+
+    #     predict = {"z" : z_hat,
+    #                 "pitch" : p_prime, #p_predict,
+    #                 "mfcc" : mfcc_prime, #m_predict,
+    #                 "rms" : rms_prime, #r_predict
+    #     }
+
+    #     return loss, predict
+
+    def forward(self, *a, **kw):
+        return self.forwardV2(*a, **kw)
+
+    def forwardV1(self, z, p, mfcc, rms, inst, z_prime, p_prime,mfcc_prime, rms_prime, inst_prime):
         
         #get z input in coninuous mode
         z_codes = z
@@ -432,6 +784,70 @@ class disentangle(nn.Module):
         C_loss = nn.NLLLoss()
         MSE_loss = nn.MSELoss()
         COS_loss = nn.CosineEmbeddingLoss()
+ 
+        p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        # p[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
+        p_prime = p_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        # p_prime[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
+        mfcc = mfcc[..., :z.shape[-1]]
+        mfcc_prime = mfcc_prime[..., :z.shape[-1]]
+        rms = rms[..., :z.shape[-1]]
+        rms_prime = rms_prime[..., :z.shape[-1]]
+
+
+        p_embedding = self.encode_pitch(p)
+        p_embedding_prime = self.encode_pitch(p_prime)
+
+        
+
+        #get the rest embedding form the rest encoder (should learn to subtract pitch)
+
+        rest_embedding = self.encode_rest(z)
+        rest_embedding =  rest_embedding - p_embedding
+
+        #put embeddings into class public class attributes for access in computing metrics
+        self.pitch_emb = p_embedding
+        self.rest_emb = rest_embedding
+
+        #decode back to z
+        z_hat = self.decoder(p_embedding_prime +  rest_embedding)#self.decoder(torch.cat((p_predict, m_predict, r_predict), dim=1)) 
+
+
+        #get loss of predicting token
+        token_predict_loss = C_loss(z_hat, z_prime_codes)
+
+        z_hat = torch.argmax(z_hat, dim=1)
+
+
+        loss = {"t_predict": token_predict_loss,
+
+                }
+
+        predict = {"z" : z_hat,
+                    "pitch" : p_prime, #p_predict,
+                    "mfcc" : mfcc_prime, #m_predict,
+                    "rms" : rms_prime, #r_predict
+        }
+
+        return loss, predict
+
+    def forwardV2(self, z, p, mfcc, rms, inst, z_prime, p_prime,mfcc_prime, rms_prime, inst_prime):
+        
+        #get z input in coninuous mode
+        z_codes = z
+        # with torch.no_grad():
+        #     z = self.dacModel.quantizer.from_codes(z)[0]
+        
+
+        #get z_prime in continuous mode
+        z_prime_codes = z_prime
+        # with torch.no_grad():
+        #     z_prime = self.dacModel.quantizer.from_codes(z_prime)[0]
+        
+        #loss categorical and regression loss functions
+        C_loss = nn.NLLLoss()
+        MSE_loss = nn.MSELoss()
+        COS_loss = nn.CosineEmbeddingLoss()
 
         #predict pitch
         # p_predict = self.pitch_predict(z_prime)
@@ -442,17 +858,21 @@ class disentangle(nn.Module):
 
         # #predict rms
         # r_predict = self.rms_predict(z_prime)
+        rest_embedding = self.encode_rest(z.float())
 
-        p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        p = p.unsqueeze(1).expand(-1, rest_embedding.shape[-1]).unsqueeze(1).float()
         # p[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
-        p_prime = p_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        p_out = p_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        p_prime = p_prime.unsqueeze(1).expand(-1, rest_embedding.shape[-1]).unsqueeze(1).float()
         # p_prime[:,:, ((z.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
         mfcc = mfcc[..., :z.shape[-1]]
-        mfcc_prime = mfcc_prime[..., :z.shape[-1]]
+        mfcc_out = mfcc_prime[..., :z.shape[-1]]
+        mfcc_prime = mfcc_prime[..., :rest_embedding.shape[-1]]
         rms = rms[..., :z.shape[-1]]
-        rms_prime = rms_prime[..., :z.shape[-1]]
-        inst = inst.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
-        inst_prime = inst_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+        rms_out = rms_prime[..., :z.shape[-1]]
+        rms_prime = rms_prime[..., :rest_embedding.shape[-1]]
+        # inst = inst.unsqueeze(1).expand(-1, rest_embedding.shape[-1]).unsqueeze(1).float()
+        # inst_prime = inst_prime.unsqueeze(1).expand(-1, rest_embedding.shape[-1]).unsqueeze(1).float()
 
         # recon_loss = MSE_loss(z_prime, z_prime_hat)
         #get loss of pitch prediction
@@ -469,16 +889,15 @@ class disentangle(nn.Module):
 
 
         p_embedding = self.encode_pitch(p)
-        r_embedding = self.encode_rms(rms)
-        m_embedding = self.encode_mfcc(inst)
+        # r_embedding = self.encode_rms(rms)
+        # m_embedding = self.encode_mfcc(inst)
         p_embedding_prime = self.encode_pitch(p_prime)
-        r_embedding_prime = self.encode_rms(rms_prime)
-        m_embedding_prime = self.encode_mfcc(inst_prime)
+        # r_embedding_prime = self.encode_rms(rms_prime)
+        # m_embedding_prime = self.encode_mfcc(inst_prime)
         
 
         #get the rest embedding form the rest encoder (should learn to subtract pitch)
 
-        rest_embedding = self.encode_rest(z)
         rest_embedding =  rest_embedding - p_embedding
 
 
@@ -499,7 +918,7 @@ class disentangle(nn.Module):
         token_predict_loss = C_loss(z_hat, z_prime_codes)
 
         #get loss of embedding similarity
-        pitch_ce_loss = COS_loss(p_embedding.view(z.shape[0], p_embedding.shape[1]*p_embedding.shape[2]), rest_embedding.view(z.shape[0], rest_embedding.shape[1]*rest_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
+        # pitch_ce_loss = COS_loss(p_embedding.view(z.shape[0], p_embedding.shape[1]*p_embedding.shape[2]), rest_embedding.view(z.shape[0], rest_embedding.shape[1]*rest_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
         # mfcc_ce_loss = COS_loss(m_embedding.view(z.shape[0], m_embedding.shape[1]*m_embedding.shape[2]), rest_embedding.view(z.shape[0], rest_embedding.shape[1]*rest_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
         # rms_ce_loss = COS_loss(r_embedding.view(z.shape[0], r_embedding.shape[1]*r_embedding.shape[2]), rest_embedding.view(z.shape[0], rest_embedding.shape[1]*rest_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
         # pm_ce_loss = COS_loss(p_embedding.view(z.shape[0], p_embedding.shape[1]*p_embedding.shape[2]), m_embedding.view(z.shape[0], m_embedding.shape[1]*m_embedding.shape[2]), torch.full((z.shape[0],), -1).to(self.device))
@@ -522,7 +941,7 @@ class disentangle(nn.Module):
                 # "p_recon": pitch_predict_loss,
                 # "m_recon": mfcc_predict_loss,
                 # "r_recon": rms_predict_loss,
-                "p_ce_loss": pitch_ce_loss,
+                # "p_ce_loss": pitch_ce_loss,
                 # "m_ce_loss": mfcc_ce_loss,
                 # "r_ce_loss": rms_ce_loss,
                 # "pm_ce_loss": pm_ce_loss,
@@ -531,9 +950,9 @@ class disentangle(nn.Module):
                 }
 
         predict = {"z" : z_hat,
-                    "pitch" : p_prime, #p_predict,
-                    "mfcc" : mfcc_prime, #m_predict,
-                    "rms" : rms_prime, #r_predict
+                    "pitch" : p_out, #p_predict,
+                    "mfcc" : mfcc_out, #m_predict,
+                    "rms" : rms_out, #r_predict
         }
 
         return loss, predict

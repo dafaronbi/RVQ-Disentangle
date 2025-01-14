@@ -1,0 +1,18 @@
+lr: 0.001
+save_path: saved_models/another_test.pt
+tb_path: tensorboard/another_test
+data_path: 
+  - data/test_tensor_JC_0.pt
+validation_data_path:
+  - data/test_tensor_JC_0.pt
+test_data_path: 
+  - data/test_tensor_JC_0.pt
+batch_size: 5
+v_frequency: 100
+verbos: True
+encoder_epochs: 1000
+train_encoder: False
+train_continue: False
+epochs: 2000
+instruments: [759] #[759, 417, 644, 97] #, 43, 701, 123, 37, 701, 488, 914, 224, 572, 82] #, 327] [771] 
+num_workers: 0

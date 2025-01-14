@@ -1,6 +1,6 @@
-lr: 0.001
-save_path: saved_models/disentangle.pt
-tb_path: tensorboard/disentangle
+lr: 0.02
+save_path: saved_models/autoencoder.pt
+tb_path: tensorboard/autoencoder
 data_path:
   - data/train_tensor_JC_0.pt
   - data/train_tensor_JC_1.pt
@@ -26,12 +26,13 @@ data_path:
   - data/train_tensor_JC_21.pt
   - data/train_tensor_JC_22.pt
   - data/train_tensor_JC_23.pt
+
 validation_data_path: 
   - data/valid_tensor_JC_0.pt
   - data/valid_tensor_JC_1.pt
 test_data_path: 
   - data/test_tensor_JC_0.pt
-batch_size: 500
+batch_size: 400
 verbos: True
 encoder_epochs: 30
 train_encoder: False

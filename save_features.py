@@ -23,18 +23,20 @@ model.eval()
 filenames = glob.glob(os.path.join(data_dir, "audio/*.wav"))
 
 for filename in filenames:
-    print(filename[:-4])
-    samples, sr = librosa.load(filename, sr=44100)
-    frame_size = len(samples)
-    t_samples = torch.tensor(samples).to(device)
-    z, codes, latents, _, _ = model.encode(t_samples[None,None,:])
 
-    # mfcc = librosa.feature.mfcc(y=samples, sr = sr)
-    # pyin,_,_ = librosa.pyin(y=samples, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr = sr, fill_na=0.0)
-    # pyin = np.expand_dims(pyin,0)
-    # rms = librosa.feature.rms(y=samples)
+    if not os.path.exists(filename[:-4] + "_zcodes.npy"):
+        print(filename[:-4])
+        samples, sr = librosa.load(filename, sr=44100)
+        frame_size = len(samples)
+        t_samples = torch.tensor(samples).to(device)
+        z, codes, latents, _, _ = model.encode(t_samples[None,None,:])
 
-    np.save(filename[:-4] + "_zcodes", codes.detach().cpu().numpy())
-    # np.save(filename[:-4] + "_mfcc", mfcc)
-    # np.save(filename[:-4] + "_pitch", pyin)
-    # np.save(filename[:-4] + "_rms", rms)
+        # mfcc = librosa.feature.mfcc(y=samples, sr = sr)
+        # pyin,_,_ = librosa.pyin(y=samples, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr = sr, fill_na=0.0)
+        # pyin = np.expand_dims(pyin,0)
+        # rms = librosa.feature.rms(y=samples)
+
+        np.save(filename[:-4] + "_zcodes", codes.detach().cpu().numpy())
+        # np.save(filename[:-4] + "_mfcc", mfcc)
+        # np.save(filename[:-4] + "_pitch", pyin)
+        # np.save(filename[:-4] + "_rms", rms)

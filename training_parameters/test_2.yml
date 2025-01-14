@@ -1,7 +1,7 @@
-lr: 0.001
-save_path: saved_models/disentangle.pt
-tb_path: tensorboard/disentangle
-data_path:
+lr: 0.01
+save_path: saved_models/new_test.pt
+tb_path: tensorboard/new_test
+data_path: 
   - data/train_tensor_JC_0.pt
   - data/train_tensor_JC_1.pt
   - data/train_tensor_JC_2.pt
@@ -26,17 +26,20 @@ data_path:
   - data/train_tensor_JC_21.pt
   - data/train_tensor_JC_22.pt
   - data/train_tensor_JC_23.pt
-validation_data_path: 
+  # - data/test_tensor_JC_0.pt
+validation_data_path:
+  # - data/test_tensor_JC_0.pt
   - data/valid_tensor_JC_0.pt
   - data/valid_tensor_JC_1.pt
 test_data_path: 
   - data/test_tensor_JC_0.pt
+  # - data/train_tensor_JC_0.pt
 batch_size: 500
+v_frequency: 20
 verbos: True
-encoder_epochs: 30
+encoder_epochs: 1000
 train_encoder: False
 train_continue: False
 epochs: 500
-v_frequency: 10
-instruments: null
+instruments: null #[759] #[759, 417, 644, 97] #, 43, 701, 123, 37, 701, 488, 914, 224, 572, 82] #, 327] [771] 
 num_workers: 0

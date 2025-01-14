@@ -1,9 +1,11 @@
 import dataset
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import torch
 from torch import nn, optim
 from torch.utils.tensorboard import SummaryWriter
 import argparse
-import os
+
 import yaml
 import auraloss
 import dac
@@ -18,6 +20,104 @@ from torch.distributed import init_process_group, destroy_process_group
 from torchmetrics.clustering import MutualInfoScore
 import matplotlib.pyplot as plt
 import random
+
+import math
+from typing import Iterator, Optional, TypeVar
+import torch.distributed as dist
+from torch.utils.data.dataset import Dataset
+from torch.utils.data.sampler import Sampler
+import datetime
+import sys
+
+_T_co = TypeVar("_T_co", covariant=True)
+
+class NonRedundantSampler(DistributedSampler):
+    def __init__(self, dataset: torch.utils.data.Dataset, num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None, shuffle: bool = True,
+                 seed: int = 0, drop_last: bool = False) -> None:
+        # super().__init__(self, dataset, num_replicas, rank, shuffle,
+        #                  seed, drop_last)
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]"
+            )
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.drop_last = drop_last
+        # If the dataset length is evenly divisible by # of replicas, then there
+        # is no need to drop any data, since the dataset will be split equally.
+        if self.drop_last and len(self.dataset) % self.num_replicas != 0:  # type: ignore[arg-type]
+            # Split to nearest available length that is evenly divisible.
+            # This is to ensure each rank receives the same amount of data when
+            # using this Sampler.
+            self.num_samples = math.ceil(
+                (len(self.dataset) - self.num_replicas) / self.num_replicas  # type: ignore[arg-type]
+            )
+        else:
+            self.num_samples = math.ceil(len(self.dataset) / self.num_replicas)  # type: ignore[arg-type]
+        self.total_size = self.num_samples * self.num_replicas
+        self.shuffle = shuffle
+        self.seed = seed
+        # Initialize your stuff
+
+    def __iter__(self) -> Iterator[_T_co]:
+
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()  # type: ignore[arg-type]
+        else:
+            indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
+
+        # subsample
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        # assert len(indices) == self.num_samples
+        ip_pair = set()
+        indices_to_keep = list()
+        for idx in indices:
+            if (self.dataset[idx][1].item(), self.dataset[idx][4].item()) not in ip_pair:
+                ip_pair.add((self.dataset[idx][1].item(), self.dataset[idx][4].item()))
+                indices_to_keep.append(idx)
+        
+        #check for drop last again
+        if self.drop_last and len(indices_to_keep) % self.num_replicas != 0:  # type: ignore[arg-type]
+            # Split to nearest available length that is evenly divisible.
+            # This is to ensure each rank receives the same amount of data when
+            # using this Sampler.
+            num_samples = math.ceil(
+                (len(indices_to_keep) - self.num_replicas) / self.num_replicas  # type: ignore[arg-type]
+            )
+        else:
+            num_samples = math.ceil(len(indices_to_keep) / self.num_replicas)
+        total_size = num_samples * self.num_replicas
+
+        if not self.drop_last:
+            # add extra samples to make it evenly divisible
+            padding_size = total_size - len(indices_to_keep)
+            if padding_size <= len(indices_to_keep):
+                indices_to_keep += indices_to_keep[:padding_size]
+            else:
+                indices_to_keep += (indices_to_keep * math.ceil(padding_size / len(indices_to_keep)))[
+                    :padding_size
+                ]
+        else:
+            # remove tail of data to make it evenly divisible.
+            indices_to_keep = indices_to_keep[: total_size]
+        assert len(indices_to_keep) == total_size
+
+        return iter(indices_to_keep)
+
 
 def ddp_setup(rank: int, world_size: int):
     """
@@ -105,33 +205,38 @@ def main(rank, world_size):
     # How many GPUs are there?
     if rank == 0:
         print("GPU COUNT: " + str(gpu_count))
-
+        sys.stdout.flush()
 
     #get training and validation datasets
     # device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     device = rank
     if rank == 0:
         print("LOADING TRAINING DATA...")
+        sys.stdout.flush()
     # d_path = ["train_tensor_" + str(i) + ".pt" for i in range(12)]
     # d_path = ["test_tensor_JC_" + str(i) + ".pt" for i in range(1)]
+    # data = dataset.NSynth_test_bass()
     data = dataset.NSynth_transform_ram(training_params["data_path"], instruments=training_params["instruments"])
     train_loader = torch.utils.data.DataLoader(data, batch_size=batch_size, sampler=DistributedSampler(data), drop_last=False, num_workers=training_params["num_workers"])
     if rank == 0:
         print("DONE!!")
+        sys.stdout.flush()
 
     valid_loader = train_loader
 
     if rank == 0:
         print("LOADING VALIDATION DATA...")
+        sys.stdout.flush()
     # d_path = ["train_tensor_" + str(i) + ".pt" for i in range(12)]
     # v_d_path = ['valid_tensor_JC_0.pt', 'valid_tensor_JC_1.pt']
+    # v_data = dataset.NSynth_test_bass()
     v_data = dataset.NSynth_transform_ram(training_params["validation_data_path"], instruments=training_params["instruments"])
-    valid_loader = torch.utils.data.DataLoader(v_data, batch_size=5, sampler=DistributedSampler(data), drop_last=False, num_workers=training_params["num_workers"])
+    valid_loader = torch.utils.data.DataLoader(v_data, batch_size=5, sampler=DistributedSampler(v_data), drop_last=False, num_workers=training_params["num_workers"])
     if rank == 0:
         print("DONE!!")
+        sys.stdout.flush()
 
     v_frequency = training_params["v_frequency"]
-
 
     disentangle = model.disentangle(device=rank).to(device)
     disentangle = DDP(disentangle, device_ids=[device], output_device=rank, find_unused_parameters=True)
@@ -141,8 +246,7 @@ def main(rank, world_size):
 
     optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" not in name and "mfcc_predict" not in name and "rms_predict" not in name and "dacModel" not in name], lr=lr)
     rest_parameters = [name for name, p in disentangle.module.named_parameters() if "pitch_predict" not in name and "mfcc_predict" not in name and "rms_predict" not in name and "dacModel" not in name]
-    
-    
+ 
     #optimizer for feature vectors
     feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name and "dacModel" not in name], lr=lr)
     enc_parameters = [name for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name in name and "dacModel" not in name]
@@ -152,7 +256,9 @@ def main(rank, world_size):
     # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, gamma=0.99)
 
     #log for tensorboard
-    writer = SummaryWriter(training_params["tb_path"])
+    writer = SummaryWriter(training_params["tb_path"] + "/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+    torch.cuda.empty_cache()
 
     if training_params["train_continue"]:
         old_model = torch.load(save_path).to(device)
@@ -200,6 +306,7 @@ def main(rank, world_size):
                     if rank == 0:
                         print(f"sample {batch_idx + 1} out of {len(train_loader)}")
                         print(loss.item())
+                        sys.stdout.flush()
             
             writer.add_scalar("Encoder Loss/Reconstruct", loss_total_r / len(train_loader), epoch)
             writer.add_scalar("Encoder Loss/Pitch Predict", loss_total_pitch / len(train_loader), epoch)
@@ -211,48 +318,10 @@ def main(rank, world_size):
         disentangle.pitch_predict.load_state_dict(old_model.pitch_predict.state_dict())
         disentangle.mfcc_predict.load_state_dict(old_model.mfcc_predict.state_dict())
         disentangle.rms_predict.load_state_dict(old_model.rms_predict.state_dict())
-        disentangle.encode_rest.load_state_dict(old_model.encode_rest.state_dict())
-        disentangle.decoder.load_state_dict(old_model.decoder.state_dict())
         disentangle = DDP(disentangle, device_ids=[device], output_device=rank, find_unused_parameters=True)
         optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" not in name and "mfcc_predict" not in name and "rms_predict" not in name and "dacModel" not in name], lr=lr)
         feature_optimizer = optim.Adam([p for name, p in disentangle.module.named_parameters() if "pitch_predict" in name or "mfcc_predict" in name or "rms_predict" in name and "dacModel" not in name], lr=lr)
         torch.distributed.barrier()
-
-    # epochs = training_params["epochs"]
-    # for epoch in range(1, epochs+1):
-    #     disentangle.train()
-    #     train_loader.sampler.set_epoch(epoch + training_params["encoder_epochs"])
-
-    #     loss_total_r = 0
-
-    #     for (batch_idx, train_tensors) in enumerate(train_loader):
-            
-    #         z,p,mfcc,rms,z_prime,p_prime,mfcc_prime,rms_prime = train_tensors   
-
-    #         z = z.to(device)[:,0,:,:]
-    #         z_prime = z_prime.to(device)[:,0,:,:]
-    #         p_prime = p.to(device)
-    #         mfcc_prime = mfcc_prime.to(device)
-    #         rms_prime = rms_prime.to(device)
-    #         l,_ = disentangle.module.train_recon(z,z_prime, p_prime,mfcc_prime, rms_prime)
-
-    #         loss = l["t_predict"] 
-            
-
-    #         loss.backward()
-    #         torch.nn.utils.clip_grad_norm_(disentangle.parameters(), 0.0001)
-
-    #         optimizer.step()
-    #         optimizer.zero_grad(set_to_none=True)
-
-    #         loss_total_r +=  loss
-
-    #         if training_params["verbos"]:
-    #             if rank == 0:
-    #                 print(f"sample {batch_idx + 1} out of {len(train_loader)}")
-    #                 print(loss.item())
-        
-    #     writer.add_scalar("Loss/Recon", loss_total_r / len(train_loader), epoch)
 
     epochs = training_params["epochs"]
     for epoch in range(1,epochs+1): 
@@ -291,51 +360,15 @@ def main(rank, world_size):
             #     loss = 0.0*l["t_predict"] + 0.0*l["p_ce_loss"] + 0.0*l["r_ce_loss"] + 0.0*l["pr_ce_loss"] + l["p_predict"] + l["m_predict"] + l["r_predict"]
             # else:
 
-            loss = l["t_predict"] + l["p_ce_loss"] #+ l["r_ce_loss"] + l["pr_ce_loss"]
+            loss = l["t_predict"] #+ l["p_ce_loss"] #+ l["r_ce_loss"] + l["pr_ce_loss"]
 
 
             loss.sum().backward()
             torch.nn.utils.clip_grad_norm_(disentangle.parameters(), 0.0001)
 
-            # if epoch < training_params["encoder_epochs"]:
-            #     feature_optimizer.step()
-            #     feature_optimizer.zero_grad(set_to_none=True)
-            # else:
+
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-
-            # if epoch == training_params["encoder_epochs"]:
-                
-            #     feature_optimizer.step()
-            #     feature_optimizer.zero_grad(set_to_none=True)
-                # disentangle = disentangle.module
-                # disentangle.stop_encoder_training()
-                
-                # for param in disentangle.parameters():
-                #     param.requires_grad = False
-
-                # for param in disentangle.encode_pitch.parameters():
-                #     param.requires_grad = True
-
-                # for param in disentangle.encode_mfcc.parameters():
-                #     param.requires_grad = True
-
-                # for param in disentangle.encode_rms.parameters():
-                #     param.requires_grad = True
-
-                # for param in disentangle.encode_rms.parameters():
-                #     param.requires_grad = True
-
-                # for param in disentangle.decoder.parameters():
-                #     param.requires_grad = True
-
-                # disentangle.pitch_predict.eval()
-                # disentangle.mfcc_predict.eval()
-                # disentangle.rms_predict.eval()
-                # disentangle.dacModel.eval()
-
-                # disentangle = DDP(disentangle, device_ids=[device], output_device=rank, find_unused_parameters=True)
-                # optimizer = optim.Adam( filter(lambda p: p.requires_grad, disentangle.module.parameters()),lr=lr)
             
 
             loss_total += loss.item()
@@ -344,12 +377,13 @@ def main(rank, world_size):
             # loss_total_mfcc += l["m_recon"].item()
             # loss_total_rms += l["r_recon"].item()s
             loss_total_r += l["t_predict"].item()
-            loss_total_ce += (l["p_ce_loss"]).item() #+ l["r_ce_loss"] + l["pr_ce_loss"]).item()
+            loss_total_ce += 0 #(l["p_ce_loss"]).item() #+ l["r_ce_loss"] + l["pr_ce_loss"]).item()
 
             if training_params["verbos"]:
                 if rank == 0:
                     print(f"sample {batch_idx + 1} out of {len(train_loader)}")
                     print(loss.item())
+                    sys.stdout.flush()
 
         
         # scheduler.step()
@@ -371,133 +405,133 @@ def main(rank, world_size):
             if rank == 0:
                 torch.save(disentangle.module, save_path)
 
-            v_loss_total = 0
-            # v_loss_total_pitch = 0
-            # v_loss_total_mfcc = 0
-            # v_loss_total_rms = 0
-            v_loss_total_r = 0
-            v_loss_total_ce = 0
+            # v_loss_total = 0
+            # # v_loss_total_pitch = 0
+            # # v_loss_total_mfcc = 0
+            # # v_loss_total_rms = 0
+            # v_loss_total_r = 0
+            # v_loss_total_ce = 0
 
-            i = 0
-            valid_loader.sampler.set_epoch(0)
-            for v_data in valid_loader:
-                #create DAC encoder and decoder
-                model_path = dac.utils.download(model_type="44khz")
-                model = dac.DAC.load(model_path).to(device)
-                model.eval()
+            # i = 0
+            # valid_loader.sampler.set_epoch(0)
+            # for v_data in valid_loader:
+            #     #create DAC encoder and decoder
+            #     model_path = dac.utils.download(model_type="44khz")
+            #     model = dac.DAC.load(model_path).to(device)
+            #     model.eval()
 
-                z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = v_data 
+            #     z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = v_data 
 
-                z = z.to(device)[:,0,:,:]
-                p = p.to(device)
-                mfcc = mfcc.to(device)
-                rms = rms.to(device)
-                inst = inst.to(device)
-                z_prime = z_prime.to(device)[:,0,:,:]
-                p_prime = p_prime.to(device)
-                mfcc_prime = mfcc_prime.to(device)
-                rms_prime = rms_prime.to(device)
-                inst_prime = inst_prime.to(device)
-                l,predict = disentangle(z,p,mfcc,rms,inst,z_prime, p_prime, mfcc_prime, rms_prime, inst_prime)
+            #     z = z.to(device)[:,0,:,:]
+            #     p = p.to(device)
+            #     mfcc = mfcc.to(device)
+            #     rms = rms.to(device)
+            #     inst = inst.to(device)
+            #     z_prime = z_prime.to(device)[:,0,:,:]
+            #     p_prime = p_prime.to(device)
+            #     mfcc_prime = mfcc_prime.to(device)
+            #     rms_prime = rms_prime.to(device)
+            #     inst_prime = inst_prime.to(device)
+            #     l,predict = disentangle(z,p,mfcc,rms,inst,z_prime, p_prime, mfcc_prime, rms_prime, inst_prime)
 
-                # v_loss_total_pitch +=  l["p_predict"].item()
-                # v_loss_total_mfcc += l["m_predict"].item()
-                # v_loss_total_rms += l["r_predict"].item()
-                v_loss_total_r += l["t_predict"].item()
-                v_loss_total_ce += (l["p_ce_loss"]).item() #+ l["r_ce_loss"] + l["pr_ce_loss"]).item()
-                v_loss_total = v_loss_total_r + v_loss_total_ce #+ v_loss_total_pitch + v_loss_total_mfcc + v_loss_total_rms 
+            #     # v_loss_total_pitch +=  l["p_predict"].item()
+            #     # v_loss_total_mfcc += l["m_predict"].item()
+            #     # v_loss_total_rms += l["r_predict"].item()
+            #     v_loss_total_r += l["t_predict"].item()
+            #     v_loss_total_ce += 0 #(l["p_ce_loss"]).item() #+ l["r_ce_loss"] + l["pr_ce_loss"]).item()
+            #     v_loss_total = v_loss_total_r + v_loss_total_ce #+ v_loss_total_pitch + v_loss_total_mfcc + v_loss_total_rms 
 
-                #make p span across time
-                p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
-                p[:,:, ((z.shape[-1]*disentangle.module.pc_num)//disentangle.module.pc_denom):] = torch.tensor(0).to(disentangle.module.device)
+            #     #make p span across time
+            #     p = p.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+            #     p[:,:, ((z.shape[-1]*disentangle.module.pc_num)//disentangle.module.pc_denom):] = torch.tensor(0).to(disentangle.module.device)
 
-                p_prime = p_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
-                p_prime[:,:, ((z.shape[-1]*disentangle.module.pc_num)//disentangle.module.pc_denom):] = torch.tensor(0).to(disentangle.module.device)
+            #     p_prime = p_prime.unsqueeze(1).expand(-1, z.shape[-1]).unsqueeze(1).float()
+            #     p_prime[:,:, ((z.shape[-1]*disentangle.module.pc_num)//disentangle.module.pc_denom):] = torch.tensor(0).to(disentangle.module.device)
 
-                #turn p from midi to hertz
-                p = 440 * 2**((p-69)/12)
-                p_prime = 440 * 2**((p_prime-69)/12)
-                p_hat = 440 * 2**((predict["pitch"]-69)/12)
+            #     #turn p from midi to hertz
+            #     p = 440 * 2**((p-69)/12)
+            #     p_prime = 440 * 2**((p_prime-69)/12)
+            #     p_hat = 440 * 2**((predict["pitch"]-69)/12)
 
                 
-                z_prime_codes = z_prime
-                z_prime = model.quantizer.from_codes(z_prime_codes[0].unsqueeze(0))[0]
+            #     z_prime_codes = z_prime
+            #     z_prime = model.quantizer.from_codes(z_prime_codes[0].unsqueeze(0))[0]
 
-                z_codes = z
-                z = model.quantizer.from_codes(z_codes[0].unsqueeze(0))[0]
+            #     z_codes = z
+            #     z = model.quantizer.from_codes(z_codes[0].unsqueeze(0))[0]
 
-                out_codes = predict["z"]
-                out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
+            #     out_codes = predict["z"]
+            #     out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
 
-                with torch.no_grad():
-                    input_audio = model.decode(z_prime)
-                    output_audio = model.decode(out)
+            #     with torch.no_grad():
+            #         input_audio = model.decode(z_prime)
+            #         output_audio = model.decode(out)
 
-                writer.add_audio(f"Audio/Ground Truth-{i}:"  , input_audio[0])
-                writer.add_audio(f"Audio/Reconstruction-{i}" , output_audio[0])
+            #     writer.add_audio(f"Audio/Ground Truth-{i}:"  , input_audio[0])
+            #     writer.add_audio(f"Audio/Reconstruction-{i}" , output_audio[0])
 
-                samples = input_audio[0][0]
-                mfcc =  mfcc_prime * (data.mfcc_max - data.mfcc_min) + data.mfcc_min
-                mfcc_hat = (predict["mfcc"] * (data.mfcc_max - data.mfcc_min) + data.mfcc_min)
+            #     samples = input_audio[0][0]
+            #     mfcc =  mfcc_prime * (data.mfcc_max - data.mfcc_min) + data.mfcc_min
+            #     mfcc_hat = (predict["mfcc"] * (data.mfcc_max - data.mfcc_min) + data.mfcc_min)
 
 
-                writer.add_image(f"Pitch/Ground Truth-{i}", make_pitch_img(samples, p_prime[0]), dataformats='HWC')
-                writer.add_image(f"Pitch/Reconstruction-{i}", make_pitch_img(samples, p_hat[0]), dataformats='HWC')
+            #     writer.add_image(f"Pitch/Ground Truth-{i}", make_pitch_img(samples, p_prime[0]), dataformats='HWC')
+            #     writer.add_image(f"Pitch/Reconstruction-{i}", make_pitch_img(samples, p_hat[0]), dataformats='HWC')
 
-                writer.add_image(f"MFCC/Ground Truth-{i}", make_mfcc_img(mfcc), dataformats='HWC')
-                writer.add_image(f"MFCC/Reconstruction-{i}", make_mfcc_img(mfcc_hat), dataformats='HWC')
+            #     writer.add_image(f"MFCC/Ground Truth-{i}", make_mfcc_img(mfcc), dataformats='HWC')
+            #     writer.add_image(f"MFCC/Reconstruction-{i}", make_mfcc_img(mfcc_hat), dataformats='HWC')
 
-                writer.add_image(f"RMS/Ground Truth-{i}", make_rms_img(rms_prime), dataformats='HWC')
-                writer.add_image(f"RMS/Reconstruction-{i}", make_rms_img(predict["rms"]), dataformats='HWC')
-                if i >2:
-                    break
-                i += 1
+            #     writer.add_image(f"RMS/Ground Truth-{i}", make_rms_img(rms_prime), dataformats='HWC')
+            #     writer.add_image(f"RMS/Reconstruction-{i}", make_rms_img(predict["rms"]), dataformats='HWC')
+            #     if i >2:
+            #         break
+            #     i += 1
             
-            writer.add_scalar("Validation Loss/Total", v_loss_total / len(valid_loader), epoch)
-            writer.add_scalar("Validation Loss/Recon", v_loss_total_r / len(valid_loader), epoch)
-            # writer.add_scalar("Validation Loss/Pitch Predict", v_loss_total_pitch / len(valid_loader), epoch)
-            # writer.add_scalar("Validation Loss/Timbre Predict", v_loss_total_mfcc / len(valid_loader), epoch)
-            # writer.add_scalar("Validation Loss/Loudness Predict", v_loss_total_rms / len(valid_loader), epoch)
-            writer.add_scalar("Validation Loss/Cosine Embedding", v_loss_total_ce / len(valid_loader), epoch)
+            # writer.add_scalar("Validation Loss/Total", v_loss_total / len(valid_loader), epoch)
+            # writer.add_scalar("Validation Loss/Recon", v_loss_total_r / len(valid_loader), epoch)
+            # # writer.add_scalar("Validation Loss/Pitch Predict", v_loss_total_pitch / len(valid_loader), epoch)
+            # # writer.add_scalar("Validation Loss/Timbre Predict", v_loss_total_mfcc / len(valid_loader), epoch)
+            # # writer.add_scalar("Validation Loss/Loudness Predict", v_loss_total_rms / len(valid_loader), epoch)
+            # writer.add_scalar("Validation Loss/Cosine Embedding", v_loss_total_ce / len(valid_loader), epoch)
             
-            #create DAC encoder and decoder
-            model_path = dac.utils.download(model_type="44khz")
-            model = dac.DAC.load(model_path).to(device)
-            model.eval()
+            # #create DAC encoder and decoder
+            # model_path = dac.utils.download(model_type="44khz")
+            # model = dac.DAC.load(model_path).to(device)
+            # model.eval()
         
-            z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = next(iter(valid_loader))
+            # z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = next(iter(valid_loader))
 
-            z = z.to(device)[:,0,:,:]
-            p = p.to(device)
-            mfcc = mfcc.to(device)
-            rms = rms.to(device)
-            inst = inst.to(device)
-            z_prime = z_prime.to(device)[:,0,:,:]
-            p_prime = p_prime.to(device)
-            mfcc_prime = mfcc_prime.to(device)
-            rms_prime = rms_prime.to(device)
-            inst_prime = inst_prime.to(device)
-            _,predict = disentangle(z,p,mfcc,rms,inst,z_prime, p_prime, mfcc_prime, rms_prime, inst_prime)
+            # z = z.to(device)[:,0,:,:]
+            # p = p.to(device)
+            # mfcc = mfcc.to(device)
+            # rms = rms.to(device)
+            # inst = inst.to(device)
+            # z_prime = z_prime.to(device)[:,0,:,:]
+            # p_prime = p_prime.to(device)
+            # mfcc_prime = mfcc_prime.to(device)
+            # rms_prime = rms_prime.to(device)
+            # inst_prime = inst_prime.to(device)
+            # _,predict = disentangle(z,p,mfcc,rms,inst,z_prime, p_prime, mfcc_prime, rms_prime, inst_prime)
             
-            z_hat = predict["z"]
+            # z_hat = predict["z"]
 
-            #convert from discrete code to continuous embedding
-            z_codes = z
-            z = model.quantizer.from_codes(z)[0]
+            # #convert from discrete code to continuous embedding
+            # z_codes = z
+            # z = model.quantizer.from_codes(z)[0]
 
 
-            input_audio = model.decode(z[0].unsqueeze(0))
-            writer.add_audio(f"Audio/Input:"  , input_audio[0])
+            # input_audio = model.decode(z[0].unsqueeze(0))
+            # writer.add_audio(f"Audio/Input:"  , input_audio[0])
 
-            pitches = torch.tensor([num for num in [61, 56, 26, 35]]).to(device)
+            # pitches = torch.tensor([num for num in range(21,109)]).to(device) #[61, 56, 26, 35]])
             
-            for i in range(4):
-                z_predict = disentangle.module.get_new_sample(z_codes[0].unsqueeze(0), pitches[i].unsqueeze(0), p_start=p[0].unsqueeze(0), mfcc=mfcc[0].unsqueeze(0), rms=rms[0].unsqueeze(0), inst=inst[0].unsqueeze(0))
-                z_predict = model.quantizer.from_codes(z_predict)[0]
-                out = model.decode(z_predict)
+            # for i in range(len(range(21,109))):
+            #     z_predict = disentangle.module.get_new_sample(z_codes[0].unsqueeze(0), pitches[i].unsqueeze(0), p_start=p[0].unsqueeze(0), mfcc=mfcc[0].unsqueeze(0), rms=rms[0].unsqueeze(0), inst=inst[0].unsqueeze(0))
+            #     z_predict = model.quantizer.from_codes(z_predict)[0]
+            #     out = model.decode(z_predict)
 
-                # writer.add_audio(f"Audio/Output-{i}:"  , out[0])
-                writer.add_audio(f"Audio/Predict: pitch = {pitches[i]}" , out[0])
+            #     # writer.add_audio(f"Audio/Output-{i}:"  , out[0])
+            #     writer.add_audio(f"Audio/Predict: pitch = {pitches[i]}" , out[0])
 
             # l_curve1 = torch.arange(0,1,1/z.shape[-1])
             # l_curve2 = torch.arange(1,0,1/-z.shape[-1])
@@ -594,22 +628,6 @@ def main(rank, world_size):
 
     writer.flush()
     writer.close()
-
-
-
-
-
-
-
-
-    # # Train model.
-    # eval_every = 1
-    # best_train_loss = float("inf")
-    # timbre_enc.train()
-    # pitch_enc.train()
-    # loudness_enc.train()
-    # content_enc.train()
-    # decoder.train()
 
 
 
