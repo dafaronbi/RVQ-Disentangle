@@ -216,6 +216,7 @@ def main(rank, world_size):
     batch_size = training_params["batch_size"]
 
     gpu_count = torch.cuda.device_count()
+
     # How many GPUs are there?
     if rank == 0:
         print("GPU COUNT: " + str(gpu_count))
@@ -223,12 +224,14 @@ def main(rank, world_size):
 
     #get training and validation datasets
     device = rank
+
     if rank == 0:
         print("LOADING TRAINING DATA...")
         sys.stdout.flush()
 
     data = dataset.NSynth_transform_ram(training_params["data_path"], instruments=training_params["instruments"])
     train_loader = torch.utils.data.DataLoader(data, batch_size=batch_size, sampler=DistributedSampler(data), drop_last=False, num_workers=training_params["num_workers"])
+    
     if rank == 0:
         print("DONE!!")
         sys.stdout.flush()
@@ -279,6 +282,7 @@ def main(rank, world_size):
 
         loss_total = 0
         loss_total_r = 0
+        loss_total_c = 0
 
 
         for (batch_idx, train_tensors) in enumerate(train_loader):
@@ -288,13 +292,13 @@ def main(rank, world_size):
             p = p.to(device)
             z_prime = z_prime.to(device)[:,0,:,:]
             p_prime = p_prime.to(device)
-            l,p = m(z,p,z_prime,p_prime)
+            l,p = m(dac_model, z,p,z_prime,p_prime)
 
-            loss = l["t_predict"]
+            loss = l["t_predict"] + l["cosine"]
 
 
             loss.sum().backward()
-            # torch.nn.utils.clip_grad_norm_(m.parameters(), 0.0001)
+            torch.nn.utils.clip_grad_norm_(m.parameters(), 0.0001)
 
 
             optimizer.step()
@@ -304,6 +308,7 @@ def main(rank, world_size):
             loss_total += loss.item()
 
             loss_total_r += l["t_predict"].item()
+            loss_total_c += l["cosine"].item()
 
             if training_params["verbos"]:
                 if rank == 0:
@@ -313,6 +318,7 @@ def main(rank, world_size):
 
         writer.add_scalar("Training/Total", loss_total / len(train_loader), epoch)
         writer.add_scalar("Training/NLL Loss", loss_total_r / len(train_loader), epoch)
+        writer.add_scalar("Training/Cosine Loss", loss_total_c / len(train_loader), epoch)
 
 
         if (epoch % v_frequency) == 0:
@@ -331,7 +337,8 @@ def main(rank, world_size):
             v_accuracy_6_total = 0
             v_accuracy_7_total = 0
             v_accuracy_8_total = 0
-            v_pesq = 0
+            v_pesq_total = 0
+            v_cosine_total = 0
 
             #evaluate mode
             m.eval()
@@ -343,7 +350,7 @@ def main(rank, world_size):
                 p = p.to(device)
                 z_prime = z_prime.to(device)[:,0,:,:]
                 p_prime = p_prime.to(device)
-                l,p = m(z,p,z_prime,p_prime)
+                l,p = m(dac_model, z,p,z_prime,p_prime)
 
                 #calculate pesq of each audio sample
                 with torch.no_grad():
@@ -352,15 +359,16 @@ def main(rank, world_size):
                         o_emb = dac_model.quantizer.from_codes(p["z"][i].unsqueeze(0))[0]
                         i_audio = dac_model.decode(i_emb)
                         o_audio = dac_model.decode(o_emb)
-                        v_pesq += calculate_pesq(i_audio[0][0], o_audio[0][0])
+                        v_pesq_total += calculate_pesq(i_audio[0][0], o_audio[0][0])
                 
                 #normalize pesq score
-                v_pesq /= len(z_prime)
+                v_pesq_total /= len(z_prime)
 
                 token_acc = (p['z'] == z_prime)
 
                 #get negative log likelihood loss
                 v_nll_total += l["t_predict"].item()
+                v_cosine_total += l["cosine"].item()
 
                 #get total accuracy
                 v_accuracy_total += ((torch.count_nonzero(token_acc) / torch.numel(z_prime))*100).item()
@@ -387,7 +395,8 @@ def main(rank, world_size):
             writer.add_scalar("Validation/Accuracy Token 6", v_accuracy_6_total / len(valid_loader), epoch)
             writer.add_scalar("Validation/Accuracy Token 7", v_accuracy_7_total / len(valid_loader), epoch)
             writer.add_scalar("Validation/Accuracy Token 8", v_accuracy_8_total / len(valid_loader), epoch)
-            writer.add_scalar("Validation/PESQ", v_pesq / len(valid_loader), epoch)
+            writer.add_scalar("Validation/PESQ", v_pesq_total / len(valid_loader), epoch)
+            writer.add_scalar("Validation/Cosine", v_cosine_total/ len(valid_loader), epoch)
 
    
     ddp_cleanup()

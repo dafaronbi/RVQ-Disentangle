@@ -114,12 +114,12 @@ inst_prime = inst_prime.to(device)
 
 if "test_reconstruct" in args.experiments:
     print("<============test_reconstruct==================>")
-    l,p = disentangle(z,p,z_prime,p_prime)
+    l,predict = disentangle(model, z,p,z_prime,p_prime)
 
     z_prime_codes = z_prime
     z_prime = model.quantizer.from_codes(z_prime_codes[0].unsqueeze(0))[0]
 
-    out_codes = p["z"]
+    out_codes = predict["z"]
     out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
 
     with torch.no_grad():
@@ -129,6 +129,34 @@ if "test_reconstruct" in args.experiments:
     
     writer.add_audio(f"Audio/Ground Truth:"  , input_audio[0])
     writer.add_audio(f"Audio/Reconstruction" , output_audio[0])
+
+    writer.flush()
+
+    exit()
+
+if "test_pitch_sweep" in args.experiments:
+    print("<============test_pitch_sweep==================>")
+
+    z_codes = z
+    z = model.quantizer.from_codes(z_codes[0].unsqueeze(0))[0]
+
+    with torch.no_grad():
+        input_audio = model.decode(z)
+
+    
+    writer.add_audio(f"Audio/Ground Truth={p[0].item()}:"  , input_audio[0])
+
+    for p_p in torch.tensor([num for num in [34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,45,46,47,
+    48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,
+    75,76,77,78,79,80,81,82,83,84,85,86,87,88,90]]).to(device):
+        l,predict = disentangle(model, z_codes[0].unsqueeze(0),p[0].unsqueeze(0),z_prime[0].unsqueeze(0),p_p.unsqueeze(0))
+        out_codes = predict["z"]
+        out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
+
+        with torch.no_grad():
+            output_audio = model.decode(out)
+            
+        writer.add_audio(f"Audio/Reconstruction pitch={p_p.item()}" , output_audio[0])
 
     writer.flush()
 
