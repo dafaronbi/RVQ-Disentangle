@@ -91,7 +91,7 @@ disentangle.eval()
 writer = SummaryWriter("tensorboard/inference_runs/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
 data = dataset.NSynth_transform_ram(args.dataset,instruments=args.instruments)
-test_loader = torch.utils.data.DataLoader(data, batch_size=5, shuffle=True, drop_last=True, num_workers=0*gpu_count)
+test_loader = torch.utils.data.DataLoader(data, batch_size=len(data), shuffle=True, drop_last=True, num_workers=0*gpu_count)
 
 #create DAC encoder and decoder
 model_path = dac.utils.download(model_type="44khz")
@@ -150,8 +150,8 @@ if "test_pitch_sweep" in args.experiments:
     48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,
     75,76,77,78,79,80,81,82,83,84,85,86,87,88,90]]).to(device):
         l,predict = disentangle(model, z_codes[0].unsqueeze(0),p[0].unsqueeze(0),z_prime[0].unsqueeze(0),p_p.unsqueeze(0))
-        out_codes = predict["z"]
-        out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
+        out = predict["z"]
+        # out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
 
         with torch.no_grad():
             output_audio = model.decode(out)
@@ -162,7 +162,33 @@ if "test_pitch_sweep" in args.experiments:
 
     exit()
 
-_,predict = disentangle(z,p,mfcc,rms,inst,z_prime, p_prime, mfcc_prime, rms_prime, inst_prime)
+if "test_rest_tsne" in args.experiments:
+    print("<============test_rest_tsne==================>")
+    disentangle(model, z,p,z_prime,p_prime)
+
+    rest_emb = disentangle.rest_emb[:,:,8]
+    d_redux = TSNE(n_components=2, learning_rate='auto',init='random', perplexity=40, n_iter=5000).fit_transform(rest_emb.cpu().detach().numpy())
+    # kmeans = KMeans(n_clusters=4, random_state=0, n_init="auto").fit(d_redux)
+
+
+    fig, ax = plt.subplots()
+    # cdict = {759: 'red', 417: 'blue', 644: 'green', 97: 'yellow'}
+    # i_label = {759: 'bass_electronic_018', 417: 'bass_synthetic_033', 644: 'mallet_acoustic_062', 97: 'string_acoustic_012'}
+
+    for i in np.unique(inst.cpu().detach().numpy()):
+        ix = np.where(inst.cpu().detach().numpy() == i)
+        # ax.scatter(d_redux.T[0][ix], d_redux.T[1][ix], label=i_label[i], color=cdict[i])
+        ax.scatter(d_redux.T[0][ix], d_redux.T[1][ix])
+
+    # for c in kmeans.cluster_centers_:
+    #     ax.scatter(c.T[0], c.T[1])
+
+    ax.set(title='Rest Embedding TSNE scatter plot')
+    ax.legend()
+    fig.canvas.draw()
+    writer.add_image(f"Rest/TSNE", grab_buffer(fig), dataformats='HWC')
+    fig.savefig("test.png")
+    exit()
 
 p_old = p
 #make p span across time

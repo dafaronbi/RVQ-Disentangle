@@ -20,6 +20,8 @@ import torch.utils.tensorboard
 from torch import nn
 from custom_layers import nn_custom, vq_custom
 import dac
+import math
+import einops
 
 class Mean(nn.Module):
     def forward(self,x):
@@ -30,7 +32,7 @@ class new_model(nn.Module):
         super().__init__()
 
         self.device = device
-        self.emb_dim = 1024
+        self.emb_dim = 32
 
         #pitch countour (pc) numerator and denominator
         self.pc_num = 3
@@ -39,35 +41,74 @@ class new_model(nn.Module):
         self.pitch_emb = None
         self.rest_emb = None
 
+        # self.token_emb = [ torch.nn.Embedding(1024,32) for i in range(9)]
+
+        # self.enc = nn.Sequential(
+        #     nn.Conv1d(in_channels=1024, out_channels=32, kernel_size=5, stride=5, padding=0, dilation=1),
+        #     # nn.ReLU(),
+        #     # nn_custom.SwapAxes((1,2)),
+        #     # # nn.Linear(1024, 512),
+        #     # # nn.ReLU(),
+        #     # # nn.Linear(512,256),
+        #     # # nn.ReLU(),
+        #     # # nn.Linear(256, 128),
+        #     # # nn.ReLU(),
+        #     # # nn.Linear(128,64),
+        #     # # nn.ReLU(),
+        #     # nn.Linear(1024,32),
+        #     # nn.ReLU(),
+        #     # nn_custom.SwapAxes((1,2)),
+        #     # nn_custom.GRUWrap(32,32,1, batch_first=True),
+        # )
+
         self.enc = nn.Sequential(
-            nn.Conv1d(in_channels=1024, out_channels=256, kernel_size=8, stride=2, padding=0, dilation=1),
-            nn.SyncBatchNorm(256),
-            nn.ReLU(),
-            nn.Conv1d(in_channels=256, out_channels=128, kernel_size=7, stride=1, padding=3, dilation=1),
-            nn.SyncBatchNorm(128),
-            nn.ReLU(),
-            nn.Conv1d(in_channels=128, out_channels=64, kernel_size=8, stride=2, padding=0, dilation=1),
-            nn.SyncBatchNorm(64),
-            nn.ReLU(),
-            nn.Conv1d(in_channels=64, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
+            nn.Conv1d(in_channels=1024, out_channels=32, kernel_size=5, stride=1, padding = 2, dilation=1),
+            nn_custom.ResidualWrapper(
+            nn.Sequential(
             nn.SyncBatchNorm(32),
             nn.ReLU(),
-            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=8, stride=2, padding=0, dilation=1),
-            nn.SyncBatchNorm(32),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=3, stride=1,  padding = 3, dilation=3),
             nn.ReLU(),
-            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
-            nn.SyncBatchNorm(32),
-            nn.ReLU(),
-            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=9, dilation=3),
-            nn.SyncBatchNorm(32),
-            nn.ReLU(),
-            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=18, dilation=6),
-            nn.SyncBatchNorm(32),
-            nn.ReLU(),
-            nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=7, stride=1, padding=27, dilation=9),
-            nn.SyncBatchNorm(self.emb_dim),
-            nn.ReLU(),
+        )
+        ),
+        nn.Conv1d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding = 3, dilation=6),
+        nn.SyncBatchNorm(32),
+        nn.ReLU(),
+        nn.Conv1d(in_channels=32, out_channels=32, kernel_size=6, stride=3,  dilation=1),
+        nn.ReLU(),
+        nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=5, stride=1, padding=2, dilation=1),
+        nn.ReLU()
             )
+        
+        # nn.Sequential(
+        #     nn.Conv1d(in_channels=1024, out_channels=256, kernel_size=8, stride=2, padding=0, dilation=1),
+        #     nn.SyncBatchNorm(256),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=256, out_channels=128, kernel_size=7, stride=1, padding=3, dilation=1),
+        #     nn.SyncBatchNorm(128),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=128, out_channels=64, kernel_size=8, stride=2, padding=0, dilation=1),
+        #     nn.SyncBatchNorm(64),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=64, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
+        #     nn.SyncBatchNorm(32),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=8, stride=2, padding=0, dilation=1),
+        #     nn.SyncBatchNorm(32),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
+        #     nn.SyncBatchNorm(32),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=9, dilation=3),
+        #     nn.SyncBatchNorm(32),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=18, dilation=6),
+        #     nn.SyncBatchNorm(32),
+        #     nn.ReLU(),
+        #     nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=7, stride=1, padding=27, dilation=9),
+        #     nn.SyncBatchNorm(self.emb_dim),
+        #     nn.ReLU(),
+        #     )
         
         # nn.Sequential(
         #     nn_custom.SwapAxes((1,2)),
@@ -77,6 +118,7 @@ class new_model(nn.Module):
         #     nn_custom.SwapAxes((1,2)),
         # )
         
+
 
         self.p_enc = torch.nn.Embedding(128,self.emb_dim)
         # nn.Sequential(
@@ -94,49 +136,62 @@ class new_model(nn.Module):
         #     nn.SyncBatchNorm(self.emb_dim),
         #     nn.ReLU(),
         # )
+        # self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=16, batch_first=True), num_layers=4)
 
         self.dec = nn.Sequential(
-            # nn.ConvTranspose1d(in_channels=self.emb_dim, out_channels=1024, kernel_size=8, stride=2, padding=0, dilation=1),
-            # nn.SyncBatchNorm(1024),
-            # nn.ReLU(),
-            # nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=3, stride=1, padding=1, dilation=1),
-            # nn.SyncBatchNorm(1024),
-            # nn.ReLU(),
-            # nn.ConvTranspose1d(in_channels=1024, out_channels=1024, kernel_size=8, stride=2, padding=0, dilation=1),
-            # nn.SyncBatchNorm(1024),
-            # nn.ReLU(),
-            # nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=3, stride=1, padding=1, dilation=1),
-            # nn.SyncBatchNorm(1024),
-            # nn.ReLU(),
-            # nn.ConvTranspose1d(in_channels=1024, out_channels=1024, kernel_size=8, stride=2, padding=0, dilation=1),
-            # nn.SyncBatchNorm(1024),
-            # nn.ReLU(),
-            nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=3, stride=1, padding=1, dilation=1),
-            nn.SyncBatchNorm(1024),
+            nn.ConvTranspose1d(in_channels=32, out_channels=32, kernel_size=6, stride=3, padding=0, dilation=1),
+            nn.SyncBatchNorm(32),
             nn.ReLU(),
-            nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=3, stride=1, padding=3, dilation=3),
-            nn.SyncBatchNorm(1024),
+            nn_custom.ResidualWrapper(
+            nn.Sequential(
+            nn.Conv1d(in_channels=self.emb_dim, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
+            nn.SyncBatchNorm(32),
             nn.ReLU(),
-            nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=3, stride=1, padding=6, dilation=6),
-            nn.SyncBatchNorm(1024),
+            )
+            ),
+            nn.Conv1d(in_channels=32, out_channels=128, kernel_size=7, stride=1, padding=11, dilation=3),
+            nn.SyncBatchNorm(128),
             nn.ReLU(),
-            nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=3, stride=1, padding=9, dilation=9),
-            nn.SyncBatchNorm(1024),
+            nn.Conv1d(in_channels=128, out_channels=256, kernel_size=7, stride=1, padding=20, dilation=6),
+            nn.SyncBatchNorm(256),
             nn.ReLU(),
-            nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=3, stride=1, padding=12, dilation=12),
-            nn.SyncBatchNorm(1024),
-            nn.ReLU(),
-            nn.Conv1d(in_channels=1024, out_channels=1024, kernel_size=3, stride=1, padding=15, dilation=15),
-            nn.SyncBatchNorm(1024),
+            # nn.Conv1d(in_channels=32, out_channels=64, kernel_size=7, stride=1, padding=27, dilation=9),
+            # nn.SyncBatchNorm(64),
+            # nn.ReLU(),
+            # nn.Conv1d(in_channels=64, out_channels=128, kernel_size=7, stride=1, padding=36, dilation=12),
+            # nn.SyncBatchNorm(128),
+            # nn.ReLU(),
+            # nn.Conv1d(in_channels=128, out_channels=256, kernel_size=7, stride=1, padding=45, dilation=15),
+            # nn.SyncBatchNorm(256),
+            # nn.ReLU(),
+            nn_custom.GRUWrap(256,256,1, batch_first=True),
             nn.ReLU(),
             nn_custom.SwapAxes((1,2)),
-            # nn.Linear(256,512),
-            # nn.Linear(512,1024),
+            # nn.Linear(32,64),
+            # nn.Linear(64,128),
+            # nn.Linear(128,256),
+            nn.Linear(256,512),
+            nn.ReLU(),
+            nn.Linear(512,1024),
+            nn.ReLU(),
             nn.Linear(1024,1024*9),
+            nn.ReLU(),
             nn_custom.SwapAxes((1,2)),
             nn.Unflatten(1, (1024,9)),
             nn.LogSoftmax(dim=1),
             )
+
+        self.proj_matrix = [torch.nn.Embedding(1024,self.device).to(self.device) for i in range(9)]
+        
+        # nn.Sequential(
+        #     # nn_custom.SwapAxes((1,2)),
+        #     # nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=16, batch_first=True), num_layers=2),
+        #     nn.Linear(self.emb_dim,1024*9),
+        #     nn_custom.SwapAxes((1,2)),
+        #     nn.Unflatten(1, (1024,9)),
+        #     nn.LogSoftmax(dim=1),
+        # )
+        
         
         # nn.Sequential(
         #     nn_custom.SwapAxes((1,2)),
@@ -150,21 +205,8 @@ class new_model(nn.Module):
         #     nn_custom.SwapAxes((1,2)),
         #     nn.Unflatten(1, (1024,9)),
         #     nn.LogSoftmax(dim=1),
-        # )
+        # )        
         
-        
-        
-        
-        
-        
-        # nn.Sequential(
-        #     nn_custom.SwapAxes((1,2)),
-        #     nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=8, batch_first=True), num_layers=6),
-        #     nn.Linear(self.emb_dim,1024*9),
-        #     nn_custom.SwapAxes((1,2)),
-        #     nn.Unflatten(1, (1024,9)),
-        #     nn.LogSoftmax(dim=1),
-        # )
         
         
     
@@ -182,8 +224,9 @@ class new_model(nn.Module):
 
         #get latent from audio input
 
-        latent = z.float()
-        # latent = self.enc(z.float())
+        # latent = torch.cat((torch.zeros(z.shape[0], z.shape[1],1).to(self.device), z),-1)
+        latent = self.enc(z.float())
+        # latent = torch.cat((torch.zeros(latent.shape[0], latent.shape[1],1).to(self.device), latent),-1)
         # latent = z.swapaxes(1,2)
         # enc = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=9, nhead=3), num_layers=6).to(self.device)
         # latent = enc(latent)
@@ -192,27 +235,55 @@ class new_model(nn.Module):
         # exit()
 
         #extend the length of pitch to be size of latent space
-        p = p.unsqueeze(1).expand(-1, latent.shape[-1])#.unsqueeze(1).float()
+        p = einops.repeat(p, "b  -> b (t )",t=latent.shape[-1]) #.unsqueeze(1).expand(-1, latent.shape[-1])#.unsqueeze(1).float()
         # p[:,:, ((latent.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
-        p_prime = p_prime.unsqueeze(1).expand(-1, latent.shape[-1])#.unsqueeze(1).float()
+        p_prime = einops.repeat(p_prime, "b  -> b (t )",t=latent.shape[-1]) #p_prime.unsqueeze(1).expand(-1, latent.shape[-1])#.unsqueeze(1).float()
         # p_prime[:,:, ((latent.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
 
         #get pitch embeddings
-        p_latent = self.p_enc(p).swapaxes(1,2)
-        p_prime_latent = self.p_enc(p_prime).swapaxes(1,2)
+        p_latent = einops.rearrange(self.p_enc(p), "b t d -> b d t")
+        p_prime_latent = einops.rearrange(self.p_enc(p_prime), "b t d -> b d t")
 
         #get rest embedding by subtract former pitch
         rest_emb = latent - p_latent
         self.rest_emb = rest_emb
+
+        #make positional embeddings
+        # max_len = latent.shape[2]
+        # d_model = latent.shape[1]
+        # batch_size = latent.shape[0]
+        # pe = torch.zeros(max_len, d_model)
+        # position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        # div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        # pe[:, 0::2] = torch.sin(position * div_term)
+        # pe[:, 1::2] = torch.cos(position * div_term)
+        # pe = pe.transpose(0, 1).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
+        # sz = rest_emb.shape[-1]
+        # mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        # mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+
         #reconstruct new pitch signal
+        # z_hat = self.dec(self.transformer((rest_emb + p_prime_latent).swapaxes(1,2), mask=mask))[:,:,:,:-1]
         z_hat = self.dec(rest_emb + p_prime_latent)
+        # z_hat = einops.rearrange(dacModel.quantizer(z_hat)[1], "b c t -> b t c")
+
+        # emb_list = []
+        # for i in range(9):
+        #     e  = einops.rearrange(self.proj_matrix[i](z_hat[:,:,i]).unsqueeze(-1), "b t e c -> b e c t")
+        #     e = torch.nn.functional.log_softmax(e, dim=1).contiguous()
+        #     emb_list.append(e)
+
+        # z_hat = torch.cat(emb_list, dim=2) 
+
 
         #loss categorical and regression loss functions
         C_loss = nn.NLLLoss(reduction='none')
         COS_loss = nn.CosineEmbeddingLoss()
+        MSE_loss = nn.MSELoss()
 
         #categorical reconstruction loss
         token_predict_loss = C_loss(z_hat, z_prime_codes)
+        # token_predict_loss = MSE_loss(z_hat, z_prime)
 
         
         #cosine loss between p_latent and rest lantent and between p_prime latent and rest latent
@@ -224,6 +295,7 @@ class new_model(nn.Module):
         token_predict_loss = token_predict_loss.mean()
 
         z_hat = torch.argmax(z_hat, dim=1)
+        # z_hat = dacModel.quantizer(z_hat)[1]
 
 
         loss = {"t_predict": token_predict_loss,
@@ -232,6 +304,64 @@ class new_model(nn.Module):
         predict = {"z" : z_hat,}
 
         return loss, predict
+
+    def generate(self, dacModel, z, p, p_prime):
+
+        #convert codes to embedding dimensions
+        z_codes = z
+        with torch.no_grad():
+            z = dacModel.quantizer.from_codes(z)[0]
+
+        #start token
+        start_seq = torch.zeros((z.shape[0], self.emb_dim,1)).to(self.device)
+        seq = torch.zeros((z.shape[0], 9 , 0)).int().to(self.device)
+
+        p_input = p
+        p_prime_input = p_prime
+
+        # keep iterating until full audio clip is created
+        while seq.shape[-1] < 344:
+            if seq.shape[-1] == 0:
+                latent = start_seq
+            else:
+                latent = dacModel.quantizer.from_codes(seq)[0]
+                latent = self.enc(latent)
+                latent = torch.cat((start_seq, latent),-1)
+
+            #reinitiallize p and primes every loop
+            p = p_input
+            p_prime = p_prime_input
+
+            #extend the length of pitch to be size of latent space
+            p = einops.repeat(p, "b  -> b (t)",t=latent.shape[-1])
+            p_prime = einops.repeat(p_prime, "b  -> b (t )",t=latent.shape[-1])
+
+            #get pitch embeddings
+            p_latent = einops.rearrange(self.p_enc(p), "b t d -> b d t")
+            p_prime_latent = einops.rearrange(self.p_enc(p_prime), "b t d -> b d t")
+
+            #get rest embedding by subtract former pitch
+            rest_emb = latent - p_latent
+            self.rest_emb = rest_emb
+
+            z_hat = self.dec(rest_emb + p_prime_latent)
+
+            #convert log softmax output to probability distribution and get last prediction
+            z_hat = torch.exp(z_hat[:, :, :, -1:])
+            z_hat = torch.argmax(z_hat, dim=1)
+
+            #sample for distribution for every rvq level
+            # new_tokens = torch.zeros((0,9,1)).to(self.device)
+            # for j in range(z_hat.shape[0]):
+            #     sampled_tokens = torch.zeros((1,0,1)).to(self.device)
+            #     for i in range(9):
+            #         sampled_tokens = torch.cat((sampled_tokens, torch.distributions.Categorical(z_hat[j,:,i,0]).sample().reshape(1,1,1)), dim=1)
+                # new_tokens = torch.cat((new_tokens, sampled_tokens), dim=0)
+
+            #append sequence
+            seq = torch.cat((seq, new_tokens.int()), -1)
+
+        return seq
 
 
 
