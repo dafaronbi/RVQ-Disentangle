@@ -260,7 +260,7 @@ class NSynth_transform_ram(data.Dataset):
         Returns:
             tuple: (audio sample, *categorical targets, json_data)
         """
-
+        
         #get first item by index
         data = self.data[index]
 
@@ -300,6 +300,151 @@ class NSynth_transform_ram(data.Dataset):
         mfcc = (mfcc - self.mfcc_min) / ( self.mfcc_max -self.mfcc_min)
         
         return [z[0], p[0], mfcc[0], rms[0], inst[0], z_prime[0], p_prime[0], mfcc_prime[0], rms_prime[0], inst_prime[0]]
+
+class NSynth_test_bass(data.Dataset):
+
+    """Pytorch dataset for NSynth dataset
+    args:
+        root: root dir containing examples.json and audio directory with
+            wav files.
+        transform (callable, optional): A function/transform that takes in
+                a sample and returns a transformed version.
+        target_transform (callable, optional): A function/transform that takes
+            in the target and transforms it.
+        blacklist_pattern: list of string used to blacklist dataset element.
+            If one of the string is present in the audio filename, this sample
+            together with its metadata is removed from the dataset.
+        categorical_field_list: list of string. Each string is a key like
+            instrument_family that will be used as a classification target.
+            Each field value will be encoding as an integer using sklearn
+            LabelEncoder.
+    """
+    def __init__(self,):
+        """Constructor"""
+        self.data = torch.load("/scratch/df2322/rvq-distentangle/nsynth-test/test_bass.pt", map_location=torch.device('cpu'))
+        
+
+        #initialize normalization values
+        self.z_max = 26.479732513427734
+        self.z_min = -23.3863525390625
+        self.mfcc_max = 368.57049560546875
+        self.mfcc_min = -1131.3709716796875
+        self.pitch_max = 2093.004522404789
+        self.pitch_min = 0
+        self.rms_max = 0.9348938465118408
+        self.rms_min = 0
+            
+        # if torch.distributed.get_rank() == 0:
+        print(len(self.data))
+        
+
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        """
+        Args:
+            index (int): Index
+        Returns:
+            tuple: (audio sample, *categorical targets, json_data)
+        """
+
+        #get first item by index
+        data = self.data[index]
+
+        # #get random second data point
+        r_index = random.randint(0, len(self)-1)
+        r_data = self.data[r_index]
+
+
+        #input data
+        z = data[0]
+        p = data[1]
+        mfcc = data[2]
+        rms = data[3]
+        inst = data[4]
+
+        #transormed data
+        z_prime = r_data[0]
+        p_prime = r_data[1]
+        mfcc_prime = r_data[2]
+        rms_prime = r_data[3]
+        inst_prime = r_data[4]
+
+        #normalize data
+        # z = (z - self.z_min) / ( self.z_max -self.z_min)
+        # z_prime = (z_prime - self.z_min) / ( self.z_max -self.z_min)
+        mfcc = (mfcc - self.mfcc_min) / ( self.mfcc_max -self.mfcc_min)
+        
+        return [z, p, mfcc, rms, inst, z_prime, p_prime, mfcc_prime, rms_prime, inst_prime]
+
+class NSynth_analysis(data.Dataset):
+
+    """Pytorch dataset for NSynth dataset
+    args:
+        root: root dir containing examples.json and audio directory with
+            wav files.
+        transform (callable, optional): A function/transform that takes in
+                a sample and returns a transformed version.
+        target_transform (callable, optional): A function/transform that takes
+            in the target and transforms it.
+        blacklist_pattern: list of string used to blacklist dataset element.
+            If one of the string is present in the audio filename, this sample
+            together with its metadata is removed from the dataset.
+        categorical_field_list: list of string. Each string is a key like
+            instrument_family that will be used as a classification target.
+            Each field value will be encoding as an integer using sklearn
+            LabelEncoder.
+    """
+    def __init__(self, files, instruments=None):
+        """Constructor"""
+        self.data = multi_threaded_file_reader(files)
+
+
+        #initialize normalization values
+        self.z_max = 26.479732513427734
+        self.z_min = -23.3863525390625
+        self.mfcc_max = 368.57049560546875
+        self.mfcc_min = -1131.3709716796875
+        self.pitch_max = 2093.004522404789
+        self.pitch_min = 0
+        self.rms_max = 0.9348938465118408
+        self.rms_min = 0
+
+        #filter instrument
+        if instruments:
+            self.data = [ d for d in self.data if d[1]["instrument"] in instruments]
+            
+        # if torch.distributed.get_rank() == 0:
+        print(len(self.data))
+        
+
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        """
+        Args:
+            index (int): Index
+        Returns:
+            tuple: (audio sample, *categorical targets, json_data)
+        """
+
+        #get first item by index
+        data = self.data[index]
+
+        z = data[0]
+        j = data[1]
+
+        # print(j)
+        #normalize data
+        # z = (z - self.z_min) / ( self.z_max -self.z_min)
+        # z_prime = (z_prime - self.z_min) / ( self.z_max -self.z_min)
+        # mfcc = (mfcc - self.mfcc_min) / ( self.mfcc_max -self.mfcc_min)
+        
+        return j
 
 
 if __name__ == "__main__":
