@@ -4,7 +4,7 @@ import torch
 
 from torch import nn
 from torch.nn import functional as F
-
+from torch.nn.init import kaiming_uniform, normal
 import argparse
 import logging
 import os
@@ -22,17 +22,220 @@ from custom_layers import nn_custom, vq_custom
 import dac
 import math
 import einops
+from einops.layers.torch import Rearrange
 
 class Mean(nn.Module):
     def forward(self,x):
         return torch.mean(x, -2)
+
+class FilterGenerator(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, filter_generator_channels):
+        super(FilterGenerator, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.filter_generator = nn.Sequential(
+            nn.Conv1d(in_channels, filter_generator_channels, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv1d(filter_generator_channels, out_channels * in_channels * kernel_size , kernel_size=1)
+        )
+
+    def forward(self, x):
+        batch_size, _, length = x.size()
+        # Generate dynamic filters
+        filters = self.filter_generator(x)
+        filters = filters.view(batch_size, self.out_channels, self.in_channels, self.kernel_size, length)
+        filters = filters.mean(0)
+        filters = filters.mean(-1)
+
+        #Shape filter
+        conv_weights = filters
+        trans_weights = einops.rearrange(filters, "o i k -> i o k")
+
+        return conv_weights,trans_weights
+
+class ResBlock(nn.Module):
+    def __init__(self, filter_size):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(filter_size, filter_size, 1, 1, 0)
+        self.conv2 = nn.Conv1d(filter_size, filter_size, 3, 1, 1, bias=False)
+        self.bn = nn.BatchNorm1d(filter_size, affine=False)
+
+        self.reset()
+
+    def forward(self, input, gamma, beta):
+        out = self.conv1(input)
+        resid = F.relu(out)
+        out = self.conv2(resid)
+        out = self.bn(out)
+
+        gamma = gamma.unsqueeze(2)
+        beta = beta.unsqueeze(2)
+
+        out = gamma * out + beta
+
+        out = F.relu(out)
+        out = out + resid
+
+        return out
+
+    def reset(self):
+        kaiming_uniform(self.conv1.weight)
+        self.conv1.bias.data.zero_()
+        kaiming_uniform(self.conv2.weight)
+
+class bNorm(nn.Module):
+    def __init__(self, num_features,device):
+        super().__init__()
+
+        if device == torch.device('cpu'):
+            self.bnLayer = nn.BatchNorm1d(num_features)
+        else:
+            self.bnLayer = nn.SyncBatchNorm(num_features)
+    
+    def forward(self, inp):
+        return self.bnLayer(inp)
+
+class attention_block(nn.Module):
+    def __init__(self, embed_dim, num_heads, device):
+        super().__init__()
+
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.device = device
+    
+    def forward(self, inp):
+        
+        output = torch.zeros((inp.shape[0], 0, inp.shape[2], inp.shape[3])).to(self.device)
+
+        for i in range(inp.shape[1]):
+            out,_ = self.multihead_attn(inp[:,i,...],inp[:,i,...],inp[:,i,...])
+            out = out.unsqueeze(1)
+            output = torch.cat((output, out), dim=1)
+        return output
+
+class transformer_block(nn.Module):
+    def __init__(self, input_size, d_model, num_heads, num_layers, device):
+        super().__init__()
+
+        self.proj = nn.Sequential(
+                nn.Linear(input_size,d_model),
+                nn.ReLU(),
+        )
+
+        self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
+        self.device = device
+        
+    
+    def forward(self, inp):
+        
+        #make positional embeddings
+        max_len = inp.shape[2]
+        d_model = inp.shape[1]
+        batch_size = inp.shape[0]
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.transpose(0, 1).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
+        sz = inp.shape[-1]
+        # mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        # mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+
+        inp = inp + pe
+        inp = einops.rearrange(inp, "b d t -> b t d")
+        output = self.proj(inp)
+        output = self.transformer(output)
+        
+        return output
+
+class cross_attention_block(nn.Module):
+    def __init__(self, embed_dim, output_size, num_heads, device):
+        super().__init__()
+
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.device = device
+        self.proj = nn.Sequential(
+                nn.ReLU(),
+                nn.Linear(embed_dim, output_size),
+                Rearrange("b t f (d c) -> b d c (t f)", d=1024),
+                nn.LogSoftmax(dim=1),
+        )
+    
+    def forward(self, inp, features):
+
+        inp = einops.rearrange(inp, "b d (t f)-> b t f d", f=8)
+        features = einops.rearrange(features, "b d (t f)-> b t f d", f=8)
+        
+        output = torch.zeros((inp.shape[0], 0, inp.shape[2], inp.shape[3])).to(self.device)
+
+        for i in range(inp.shape[1]):
+            out,_ = self.multihead_attn(inp[:,i,...],features[:,i,...], features[:,i,...])
+            out = out.unsqueeze(1)
+            output = torch.cat((output, out), dim=1)
+
+        output = self.proj(output)
+
+        return output
+
+class transformer_decoder_block(nn.Module):
+    def __init__(self, d_model, output_size, num_heads, num_layers, device):
+        super().__init__()
+
+        self.transformer = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
+        self.device = device
+        self.proj = nn.Sequential(
+                nn.Linear(d_model, output_size),
+                Rearrange("b t (d c) -> b d c t", d=1024),
+                nn.LogSoftmax(dim=1),
+        )
+        
+    
+    def forward(self, inp, features):
+        #make positional embeddings
+        max_len = inp.shape[2]
+        d_model = inp.shape[1]
+        batch_size = inp.shape[0]
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.transpose(0, 1).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
+        sz = inp.shape[-1]
+        # mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        # mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+
+        inp = inp + pe
+        inp = einops.rearrange(inp, "b d t -> b t d")
+
+        max_len = features.shape[2]
+        d_model = features.shape[1]
+        batch_size = inp.shape[0]
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.transpose(0, 1).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
+
+        features = features + pe
+        features = einops.rearrange(features, "b d t -> b t d")
+
+        output = self.transformer(inp,features)
+        output = self.proj(output)
+        
+        return output
+
         
 class new_model(nn.Module):
-    def __init__(self, device):
+    def __init__(self, device, parameters):
         super().__init__()
 
         self.device = device
-        self.emb_dim = 32
+        self.training_params = parameters
+        self.emb_dim = self.training_params["emb_dim"]
 
         #pitch countour (pc) numerator and denominator
         self.pc_num = 3
@@ -41,176 +244,256 @@ class new_model(nn.Module):
         self.pitch_emb = None
         self.rest_emb = None
 
-        # self.token_emb = [ torch.nn.Embedding(1024,32) for i in range(9)]
+        self.temperature = 1
 
-        # self.enc = nn.Sequential(
-        #     nn.Conv1d(in_channels=1024, out_channels=32, kernel_size=5, stride=5, padding=0, dilation=1),
-        #     # nn.ReLU(),
-        #     # nn_custom.SwapAxes((1,2)),
-        #     # # nn.Linear(1024, 512),
-        #     # # nn.ReLU(),
-        #     # # nn.Linear(512,256),
-        #     # # nn.ReLU(),
-        #     # # nn.Linear(256, 128),
-        #     # # nn.ReLU(),
-        #     # # nn.Linear(128,64),
-        #     # # nn.ReLU(),
-        #     # nn.Linear(1024,32),
-        #     # nn.ReLU(),
-        #     # nn_custom.SwapAxes((1,2)),
-        #     # nn_custom.GRUWrap(32,32,1, batch_first=True),
-        # )
+        self.num_heads = self.training_params["num_heads"]
 
-        self.enc = nn.Sequential(
-            nn.Conv1d(in_channels=1024, out_channels=32, kernel_size=5, stride=1, padding = 2, dilation=1),
-            nn_custom.ResidualWrapper(
-            nn.Sequential(
-            nn.SyncBatchNorm(32),
+
+        if self.training_params["codebook"] == "learned":
+            self.input_emb_dim = 512
+        
+        if self.training_params["codebook"] == "default":
+            self.input_emb_dim = 1024
+
+        if self.training_params["input_type"] == "continuous":
+            self.input_emb_dim = 1024
+        
+        if self.training_params["disentangle"] == "pesto":
+            self.input_emb_dim = 657
+
+        if self.training_params["input_dim"]:
+            self.input_emb_dim = self.training_params["input_dim"]
+
+        if self.training_params["disentangle"] == "pesto":
+            self.pesto_emb = torch.load("note_to_emb.pt")
+            self.emb_dim = 657
+            self.num_heads = 73
+
+        if self.training_params["encoder_type"] == "stride":
+            self.enc = nn.Sequential(
+            nn.Conv1d(in_channels=self.input_emb_dim, out_channels=self.emb_dim, kernel_size=16, stride=16, padding = 8, dilation=1),
+            bNorm(self.emb_dim,self.device),
             nn.ReLU(),
-            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=3, stride=1,  padding = 3, dilation=3),
+            )
+
+        if self.training_params["encoder_type"] == "no_stride":
+            self.enc = nn.Sequential(
+            nn.Conv1d(in_channels=self.input_emb_dim, out_channels=self.emb_dim, kernel_size=5, stride=1, padding =2, dilation=1),
+            bNorm(self.emb_dim,self.device),
             nn.ReLU(),
-        )
-        ),
-        nn.Conv1d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding = 3, dilation=6),
-        nn.SyncBatchNorm(32),
-        nn.ReLU(),
-        nn.Conv1d(in_channels=32, out_channels=32, kernel_size=6, stride=3,  dilation=1),
-        nn.ReLU(),
-        nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=5, stride=1, padding=2, dilation=1),
-        nn.ReLU()
+            )
+
+        if self.training_params["encoder_type"] == None:
+            self.enc = nn.Identity()
+
+        if self.training_params["encoder_type"] == "mlp":
+            self.enc = nn.Sequential(
+                nn_custom.SwapAxes((1,2)),
+                nn.Linear(self.input_emb_dim,self.emb_dim),
+                nn.ReLU(),
+                nn_custom.SwapAxes((1,2)),
+            )
+
+        if self.training_params["encoder_type"] == "gru_only":
+            self.enc = nn.Sequential(
+                nn_custom.GRUWrap(self.input_emb_dim,self.emb_dim,2, batch_first=True),
+                nn.ReLU(),
             )
         
-        # nn.Sequential(
-        #     nn.Conv1d(in_channels=1024, out_channels=256, kernel_size=8, stride=2, padding=0, dilation=1),
-        #     nn.SyncBatchNorm(256),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=256, out_channels=128, kernel_size=7, stride=1, padding=3, dilation=1),
-        #     nn.SyncBatchNorm(128),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=128, out_channels=64, kernel_size=8, stride=2, padding=0, dilation=1),
-        #     nn.SyncBatchNorm(64),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=64, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
-        #     nn.SyncBatchNorm(32),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=8, stride=2, padding=0, dilation=1),
-        #     nn.SyncBatchNorm(32),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
-        #     nn.SyncBatchNorm(32),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=9, dilation=3),
-        #     nn.SyncBatchNorm(32),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=7, stride=1, padding=18, dilation=6),
-        #     nn.SyncBatchNorm(32),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=7, stride=1, padding=27, dilation=9),
-        #     nn.SyncBatchNorm(self.emb_dim),
-        #     nn.ReLU(),
-        #     )
+        if self.training_params["encoder_type"] == "attention":
+            self.enc = nn.Sequential(
+                Rearrange("b d (t f)-> b t f d", f=8),
+                attention_block(self.emb_dim, self.num_heads, self.device),
+                nn.ReLU(),
+                Rearrange("b t f d -> b d (t f)"),
+                )
         
-        # nn.Sequential(
-        #     nn_custom.SwapAxes((1,2)),
-        #     torch.nn.Embedding(1024,self.emb_dim),
-        #     Mean(),
-        #     nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=8, batch_first=True), num_layers=6),
-        #     nn_custom.SwapAxes((1,2)),
-        # )
-        
-
+        if self.training_params["encoder_type"] == "transformer":
+            self.enc = nn.Sequential(
+                Rearrange("b d t -> b t d"),
+                nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=self.num_heads, batch_first=True), num_layers=self.training_params["num_enc_layers"]),
+                Rearrange("b t d -> b d t"),
+            )
 
         self.p_enc = torch.nn.Embedding(128,self.emb_dim)
-        # nn.Sequential(
-        #     nn.Conv1d(in_channels=1, out_channels=32, kernel_size=5, stride=1, padding=2, dilation=1),
-        #     nn_custom.ResidualWrapper(
-        #     nn.Sequential(
-        #     nn.SyncBatchNorm(32),
-        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=2),
-        #     nn.ReLU(),
-        #     )),
-        #     nn.Conv1d(in_channels=32, out_channels=32, kernel_size=5, stride=1, padding=2),
-        #     nn.SyncBatchNorm(32),
-        #     nn.ReLU(),
-        #     nn.Conv1d(in_channels=32, out_channels=self.emb_dim, kernel_size=5, stride=1, padding=2),
-        #     nn.SyncBatchNorm(self.emb_dim),
-        #     nn.ReLU(),
-        # )
-        # self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=16, batch_first=True), num_layers=4)
 
-        self.dec = nn.Sequential(
-            nn.ConvTranspose1d(in_channels=32, out_channels=32, kernel_size=6, stride=3, padding=0, dilation=1),
-            nn.SyncBatchNorm(32),
+        self.dec = nn.Sequential()
+
+        if self.training_params["codes"] == "flattened":
+            token_size = 1024
+        else:
+            token_size = 1024*9
+
+        if self.training_params["input_type"] == "continuous":
+            token_size = 1024
+
+        d_size = self.emb_dim
+        if self.training_params["disentangle"] == "concat" or self.training_params["disentangle"] == "pesto":
+            d_size = self.emb_dim*2
+        if self.training_params["disentangle"] == "across_inst" or self.training_params["disentangle"] == "random_inst":
+            d_size = self.emb_dim*3
+        
+        if self.training_params["encoder_type"] == "stride":
+            self.dec = nn.Sequential(
+                nn.ConvTranspose1d(in_channels=d_size, out_channels=d_size, kernel_size=16, stride=16, padding=4, dilation=1),
+                bNorm(d_size,self.device),
+                nn.ReLU()
+            )
+        
+            
+        # if self.training_params["disentangle"] == "concat" or self.training_params["disentangle"] == "pesto":
+        #     d_size = self.emb_dim*2
+        #     self.dec = nn.Sequential(
+        #         nn.ConvTranspose1d(in_channels=self.emb_dim*2, out_channels=self.emb_dim*2, kernel_size=16, stride=16, padding=4, dilation=1),
+        #         bNorm(self.emb_dim*2,self.device),
+        #         nn.ReLU())
+        # elif self.training_params["disentangle"] == "across_inst" or self.training_params["disentangle"] == "random_inst":
+        #     d_size = self.emb_dim*3
+        #     self.dec = nn.Sequential(
+        #         nn.ConvTranspose1d(in_channels=self.emb_dim*3, out_channels=self.emb_dim*3, kernel_size=16, stride=16, padding=4, dilation=1),
+        #         bNorm(self.emb_dim*3,self.device),
+        #         nn.ReLU()
+        #     )
+
+        dilation_index = [1,3,6,9,12,15]
+        for i in range(self.training_params["num_dec_layers"]):
+            if i == 0:
+                first_dim = d_size
+            else:
+                first_dim = 256
+            self.dec = self.dec + nn.Sequential(
+                nn.Conv1d(in_channels=first_dim, out_channels=256, kernel_size=7, stride=1, padding=3*dilation_index[i], dilation=dilation_index[i]),
+                bNorm(256,self.device),
+                nn.ReLU())
+
+        if self.training_params["decoder_type"] == "no_gru":
+            self.dec = self.dec + nn.Sequential(
+                # nn_custom.GRUWrap(256,256,1, batch_first=True),
+                nn.ReLU(),
+                nn_custom.SwapAxes((1,2)),
+                nn.Linear(256,512),
+                nn.ReLU(),
+                nn.Linear(512,1024),
+                nn.ReLU(),
+                nn.Linear(1024,token_size),
+                nn.ReLU(),
+                nn_custom.SwapAxes((1,2)),
+                nn.Unflatten(1, (1024,token_size//1024)),
+                nn.LogSoftmax(dim=1),
+                )
+
+        if self.training_params["decoder_type"] == "gru":
+            self.dec = self.dec + nn.Sequential(
+                nn_custom.GRUWrap(256,256,1, batch_first=True),
+                nn.ReLU(),
+                nn_custom.SwapAxes((1,2)),
+                nn.Linear(256,512),
+                nn.ReLU(),
+                nn.Linear(512,1024),
+                nn.ReLU(),
+                nn.Linear(1024,token_size),
+                nn.ReLU(),
+                nn_custom.SwapAxes((1,2)),
+                nn.Unflatten(1, (1024,token_size//1024)),
+                nn.LogSoftmax(dim=1),
+                )
+
+        if self.training_params["decoder_type"] == "mlp":
+            self.dec = self.dec + nn.Sequential(
+                nn_custom.SwapAxes((1,2)),
+                nn.Linear(self.emb_dim,1024),
+                nn.ReLU(),
+                nn_custom.SwapAxes((1,2)),
+                )
+        
+        if self.training_params["decoder_type"] == "mlp_discrete":
+            self.dec = self.dec + nn.Sequential(
+                nn_custom.SwapAxes((1,2)),
+                nn.Linear(self.emb_dim,1024*9),
+                nn.ReLU(),
+                Rearrange("b t (d c) -> b d c t", d=1024),
+                nn.LogSoftmax(dim=1),
+                )
+        
+        if self.training_params["decoder_type"] == "attention":
+            self.dec = self.dec + nn.Sequential(
+                Rearrange("b d (t f)-> b t f d", f=8),
+                attention_block(self.emb_dim, self.num_heads, self.device),
+                nn.Linear(self.emb_dim,1024*9),
+                nn.ReLU(),
+                Rearrange("b t f (d c)-> b d c (t f)", d=1024),
+                nn.LogSoftmax(dim=1),
+                )
+        
+        if self.training_params["decoder_type"] == "gru_only":
+            self.dec = nn.Sequential(
+                nn_custom.GRUWrap(self.input_emb_dim,self.input_emb_dim,2, batch_first=True),
+                nn.ReLU(),
+                Rearrange("b d t -> b t d "),
+                nn.Linear(self.input_emb_dim,1024),
+                nn.ReLU(),
+                nn.Linear(1024,1024*9),
+                nn.ReLU(),
+                # nn_custom.SwapAxes((1,2)),
+                # nn.Unflatten(1, (1024,9)),
+                Rearrange("b t (d c) -> b d c t", d=1024),
+                nn.LogSoftmax(dim=1),
+                # Rearrange("b t d c -> b d c t"),
+            )
+        
+        if self.training_params["decoder_type"] == "transformer":
+            self.dec = nn.Sequential(
+                # nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=64, batch_first=True), num_layers=self.training_params["num_dec_layers"]),
+                transformer_block(d_size, self.emb_dim, self.num_heads, self.training_params["num_dec_layers"], self.device),
+                torch.nn.Linear(self.emb_dim,1024*9),
+                Rearrange("b t (d c) -> b d c t", d=1024),
+                nn.LogSoftmax(dim=1),
+            )
+        
+        if self.training_params["decoder_type"] == "transformer_decoder":
+            self.dec = transformer_decoder_block(d_size, 1024*9, self.num_heads, self.training_params["num_dec_layers"], self.device)
+        
+        if self.training_params["decoder_type"] == "cross_attention":
+            self.dec = cross_attention_block(d_size, 1024*9, self.num_heads, self.device)
+
+
+        self.proj_matrix = [torch.nn.Embedding(1025,self.input_emb_dim).to(self.device) for i in range(9)]
+
+        if  self.training_params["disentangle"] == "conv" or self.training_params["disentangle"] == "conv_single":
+            k_size = self.training_params["d_conv_size"]
+            self.rest_conv = nn.Conv1d(in_channels=self.emb_dim*2, out_channels=self.emb_dim, kernel_size=k_size, padding=k_size//2,  stride=1)
+            self.transform_conv = nn.Conv1d(in_channels=self.emb_dim*2, out_channels=self.emb_dim, kernel_size=k_size, padding=k_size//2, stride=1)
+
+        if  self.training_params["disentangle"] == "FiLM":
+            self.resblocks = nn.ModuleList()
+            self.n_FiLM = self.training_params["n_FiLM"]
+            for i in range(self.n_FiLM):
+                self.resblocks.append(ResBlock(self.emb_dim))
+                self.film = nn.Linear(self.emb_dim, self.emb_dim * 2 * self.n_FiLM)
+
+        if self.training_params["disentangle"] == "across_inst" or self.training_params["disentangle"] == "random_inst":
+            self.t_enc = nn.Sequential(
+            nn.Conv1d(in_channels=self.input_emb_dim, out_channels=self.emb_dim, kernel_size=16, stride=16, dilation=1),
+            bNorm(self.emb_dim,self.device),
             nn.ReLU(),
-            nn_custom.ResidualWrapper(
-            nn.Sequential(
-            nn.Conv1d(in_channels=self.emb_dim, out_channels=32, kernel_size=7, stride=1, padding=3, dilation=1),
-            nn.SyncBatchNorm(32),
+            nn.Conv1d(in_channels=self.emb_dim, out_channels=self.emb_dim, kernel_size=21, dilation=1),
+            bNorm(self.emb_dim,self.device),
             nn.ReLU(),
             )
-            ),
-            nn.Conv1d(in_channels=32, out_channels=128, kernel_size=7, stride=1, padding=11, dilation=3),
-            nn.SyncBatchNorm(128),
-            nn.ReLU(),
-            nn.Conv1d(in_channels=128, out_channels=256, kernel_size=7, stride=1, padding=20, dilation=6),
-            nn.SyncBatchNorm(256),
-            nn.ReLU(),
-            # nn.Conv1d(in_channels=32, out_channels=64, kernel_size=7, stride=1, padding=27, dilation=9),
-            # nn.SyncBatchNorm(64),
-            # nn.ReLU(),
-            # nn.Conv1d(in_channels=64, out_channels=128, kernel_size=7, stride=1, padding=36, dilation=12),
-            # nn.SyncBatchNorm(128),
-            # nn.ReLU(),
-            # nn.Conv1d(in_channels=128, out_channels=256, kernel_size=7, stride=1, padding=45, dilation=15),
-            # nn.SyncBatchNorm(256),
-            # nn.ReLU(),
-            nn_custom.GRUWrap(256,256,1, batch_first=True),
-            nn.ReLU(),
-            nn_custom.SwapAxes((1,2)),
-            # nn.Linear(32,64),
-            # nn.Linear(64,128),
-            # nn.Linear(128,256),
-            nn.Linear(256,512),
-            nn.ReLU(),
-            nn.Linear(512,1024),
-            nn.ReLU(),
-            nn.Linear(1024,1024*9),
-            nn.ReLU(),
-            nn_custom.SwapAxes((1,2)),
-            nn.Unflatten(1, (1024,9)),
-            nn.LogSoftmax(dim=1),
-            )
 
-        self.proj_matrix = [torch.nn.Embedding(1024,self.device).to(self.device) for i in range(9)]
-        
-        # nn.Sequential(
-        #     # nn_custom.SwapAxes((1,2)),
-        #     # nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=16, batch_first=True), num_layers=2),
-        #     nn.Linear(self.emb_dim,1024*9),
-        #     nn_custom.SwapAxes((1,2)),
-        #     nn.Unflatten(1, (1024,9)),
-        #     nn.LogSoftmax(dim=1),
-        # )
-        
-        
-        # nn.Sequential(
-        #     nn_custom.SwapAxes((1,2)),
-        #     nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=8, batch_first=True), num_layers=2),
-        #     # nn.Linear(32,64),
-        #     # nn.Linear(64,128),
-        #     # nn.Linear(128,256),
-        #     # nn.Linear(256,512),
-        #     # nn.Linear(512,1024),
-        #     nn.Linear(1024,1024*9),
-        #     nn_custom.SwapAxes((1,2)),
-        #     nn.Unflatten(1, (1024,9)),
-        #     nn.LogSoftmax(dim=1),
-        # )        
-        
-        
+        self.filter_generator = FilterGenerator(32, 32, 1, 32)
         
     
     def forward(self, dacModel, z,p, z_prime,p_prime):
+
+        #loss categorical and regression loss functions
+        if self.training_params["loss_type"] == "hierarchical_nll":
+            C_loss = nn.NLLLoss(reduction='none')
+        else:
+            C_loss = nn.NLLLoss()
+
+        COS_loss = nn.CosineEmbeddingLoss()
+        MSE_loss = nn.MSELoss()
         
         #convert codes to embedding dimensions
         z_codes = z
@@ -218,53 +501,248 @@ class new_model(nn.Module):
             z = dacModel.quantizer.from_codes(z)[0]
 
         z_prime_codes = z_prime
+        z_prime_codes_saved = z_prime_codes
         with torch.no_grad():
-            z_prime = dacModel.quantizer.from_codes(z_prime)[0]
+            z_prime, z_prime_latents,_ = dacModel.quantizer.from_codes(z_prime)
         
+        # for i in range(9):
+        #     print(dacModel.quantizer.quantizers[i].codebook.weight.shape)
+        # exit()
 
         #get latent from audio input
+        d_emb = torch.zeros(z.shape[0],  z.shape[-1], 0,self.input_emb_dim).to(self.device)
 
+        for i in range(9):
+            if self.training_params["codebook"] == "learned":
+                d_emb = torch.cat((d_emb,self.proj_matrix[i](z_codes[:,i,:]).unsqueeze(-2)), dim =-2)
+            if self.training_params["codebook"] == "default":
+                temp_emb = dacModel.quantizer.quantizers[i].decode_code(z_codes[:,i,:])
+                temp_emb = dacModel.quantizer.quantizers[i].out_proj(temp_emb)
+                temp_emb = einops.rearrange(temp_emb, "b d t -> b t (1) d")
+                d_emb = torch.cat((d_emb,temp_emb), dim=-2)
+
+        if self.training_params["codes"] == "flattened":
+            z_codes = z_codes.flatten(1)
+            z_prime_codes = z_prime_codes.flatten(1)
+            d_emb = d_emb.flatten(1,2)
+        else:
+            d_emb = d_emb.sum(2)
+        
+        d_emb = einops.rearrange(d_emb, "b t d -> b d t")
+
+        if self.training_params["input_type"] == "continuous":
+            input_emb = z
+        else:
+            input_emb = d_emb
+        
         # latent = torch.cat((torch.zeros(z.shape[0], z.shape[1],1).to(self.device), z),-1)
-        latent = self.enc(z.float())
+        latent = self.enc(input_emb)
+        
         # latent = torch.cat((torch.zeros(latent.shape[0], latent.shape[1],1).to(self.device), latent),-1)
         # latent = z.swapaxes(1,2)
         # enc = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=9, nhead=3), num_layers=6).to(self.device)
         # latent = enc(latent)
+        # latent_tuple = latent.chunk(latent.shape[-1]//8,-1)
+        # latent = torch.zeros((latent.shape[0], latent.shape[1], 0)).to(self.device)
+        # for l in latent_tuple:
+        #     latent = torch.cat((latent,l.mean(-1, keepdim=True)), dim=-1)
 
-        # print(latent.shape)
-        # exit()
+        if self.training_params["c_length"]:
+            c_length = self.training_params["c_length"]
+        else:
+            c_length = latent.shape[-1]
 
         #extend the length of pitch to be size of latent space
-        p = einops.repeat(p, "b  -> b (t )",t=latent.shape[-1]) #.unsqueeze(1).expand(-1, latent.shape[-1])#.unsqueeze(1).float()
-        # p[:,:, ((latent.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
-        p_prime = einops.repeat(p_prime, "b  -> b (t )",t=latent.shape[-1]) #p_prime.unsqueeze(1).expand(-1, latent.shape[-1])#.unsqueeze(1).float()
-        # p_prime[:,:, ((latent.shape[-1]*self.pc_num)//self.pc_denom):] = torch.tensor(0).to(self.device)
+        p = einops.repeat(p, "b  -> b (t )",t=c_length)
+        note_num = p_prime[0]
+        p_prime = einops.repeat(p_prime, "b  -> b (t )",t=c_length) 
 
         #get pitch embeddings
         p_latent = einops.rearrange(self.p_enc(p), "b t d -> b d t")
         p_prime_latent = einops.rearrange(self.p_enc(p_prime), "b t d -> b d t")
 
-        #get rest embedding by subtract former pitch
-        rest_emb = latent - p_latent
-        self.rest_emb = rest_emb
+        if self.training_params["reconstruction"] == "same":
+            p_prime_latent = p_latent
 
-        #make positional embeddings
-        # max_len = latent.shape[2]
-        # d_model = latent.shape[1]
-        # batch_size = latent.shape[0]
-        # pe = torch.zeros(max_len, d_model)
-        # position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        # div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        # pe[:, 0::2] = torch.sin(position * div_term)
-        # pe[:, 1::2] = torch.cos(position * div_term)
-        # pe = pe.transpose(0, 1).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
-        # sz = rest_emb.shape[-1]
-        # mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        # mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        # rest_filt,_ = self.filter_generator(p_latent)
+        # _,dec_filt = self.filter_generator(p_prime_latent)
 
-        #reconstruct new pitch signal
-        # z_hat = self.dec(self.transformer((rest_emb + p_prime_latent).swapaxes(1,2), mask=mask))[:,:,:,:-1]
-        z_hat = self.dec(rest_emb + p_prime_latent)
+        emb_loss = torch.tensor(0.0).to(self.device)
+
+        # if self.training_params["decoder_type"] == "transformer":
+                
+        #     #make positional embeddings
+        #     max_len = latent.shape[2]
+        #     d_model = latent.shape[1]
+        #     batch_size = latent.shape[0]
+        #     pe = torch.zeros(max_len, d_model)
+        #     position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        #     div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        #     pe[:, 0::2] = torch.sin(position * div_term)
+        #     pe[:, 1::2] = torch.cos(position * div_term)
+        #     pe = pe.transpose(0, 1).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
+        #     sz = latent.shape[-1]
+        #     # mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        #     # mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+
+        #     latent = latent + pe
+        #     latent = einops.rearrange(latent, "b d t -> b t d")
+        #     p_latent = einops.rearrange(p_latent, "b d t -> b t d")
+        #     p_prime_latent = einops.rearrange(p_prime_latent, "b d t -> b t d")
+        
+        #get rest embedding
+        if self.training_params["disentangle"] == "subtract":
+            rest_emb = latent - p_latent
+            self.rest_emb = rest_emb
+            dec_input = rest_emb + p_prime_latent
+            z_hat = self.dec(dec_input)
+
+        if self.training_params["disentangle"] == None:
+            rest_emb = latent 
+            self.rest_emb = rest_emb
+            dec_input = latent
+
+            z_hat = self.dec(dec_input)
+            
+        
+        if self.training_params["disentangle"] == "conv":
+            rest_emb = self.rest_conv(torch.cat((latent,p_latent), dim=1))
+            self.rest_emb = rest_emb
+            dec_input = self.transform_conv(torch.cat((rest_emb,p_prime_latent), dim=1))
+            z_hat = self.dec(dec_input)
+
+        if self.training_params["disentangle"] == "conv_single":
+            rest_emb = latent
+            self.rest_emb = rest_emb
+            dec_input = self.transform_conv(torch.cat((latent,p_prime_latent), dim=1))
+            z_hat = self.dec(dec_input)
+
+        if self.training_params["disentangle"] == "concat":
+            rest_emb = latent
+            self.rest_emb = rest_emb
+            dec_input = torch.cat((latent,p_prime_latent), dim=1)
+            z_hat = self.dec(dec_input)
+
+        if self.training_params["disentangle"] == "pesto":
+            p_prime_latent = einops.repeat(self.pesto_emb[note_num.item()].to(self.device), "t d  -> (b) d t",b=latent.shape[0])[:,:,:latent.shape[-1]]
+            rest_emb = latent
+            self.rest_emb = rest_emb
+            dec_input = torch.cat((latent,p_prime_latent), dim=1)
+            z_hat = self.dec(dec_input)
+
+        if self.training_params["disentangle"] == "FiLM":
+            film = self.film(p_prime_latent[:, :, 0]).chunk(self.n_FiLM *2, 1)
+            out = latent
+            rest_emb = latent
+            self.rest_emb = rest_emb
+            for i, resblock in enumerate(self.resblocks):
+                out = resblock(out, film[i * 2], film[i * 2 + 1])
+            z_hat = self.dec(out)
+
+        if self.training_params["disentangle"] == "across_inst":
+
+            #get latent from audio input
+            d_prime_emb = torch.zeros(z.shape[0],  z.shape[-1], 0,self.input_emb_dim).to(self.device)
+
+            for i in range(9):
+                if self.training_params["codebook"] == "learned":
+                    d_prime_emb = torch.cat((d_prime_emb,self.proj_matrix[i](z_prime_codes_saved[:,i,:]).unsqueeze(-2)), dim =-2)
+                if self.training_params["codebook"] == "default":
+                    temp_emb = dacModel.quantizer.quantizers[i].decode_code(z_prime_codes_saved[:,i,:])
+                    temp_emb = dacModel.quantizer.quantizers[i].out_proj(temp_emb)
+                    temp_emb = einops.rearrange(temp_emb, "b d t -> b t (1) d")
+                    d_prime_emb = torch.cat((d_prime_emb,temp_emb), dim=-2)
+
+            if self.training_params["codes"] == "flattened":
+                z_codes = z_codes.flatten(1)
+                z_prime_codes = z_prime_codes.flatten(1)
+                d_prime_emb = d_prime_emb.flatten(1,2)
+            else:
+                d_prime_emb = d_prime_emb.sum(2)
+            
+            d_prime_emb = einops.rearrange(d_prime_emb, "b t d -> b d t")
+
+            if self.training_params["input_type"] == "continuous":
+                input_prime_emb = z_prime
+            else:
+                input_prime_emb = d_prime_emb
+            
+            t_emb = self.t_enc(input_emb)
+            t_emb = einops.repeat(t_emb, "b d t  -> b d (t repeat)",repeat=latent.shape[-1]) 
+            t_emb_prime = self.t_enc(input_prime_emb)
+            t_emb_prime = einops.repeat(t_emb_prime, "b d t  -> b d (t repeat)",repeat=latent.shape[-1]) 
+
+            emb_loss = MSE_loss(t_emb[:,:,0], t_emb_prime[:,:,0])
+
+            rest_emb = latent
+            self.rest_emb = rest_emb
+
+            dec_input = torch.cat((latent,p_prime_latent, t_emb), dim=1)
+            # dec_input =latent + p_prime_latent + t_emb
+            z_hat = self.dec(dec_input)
+            
+
+        if self.training_params["disentangle"] == "random_inst":
+            prime_emb = torch.zeros(z_prime.shape[0],  z_prime.shape[-1], 512).to(self.device)
+            for i in range(9):
+                prime_emb += self.proj_matrix[i](z_prime_codes[:,i,:])
+            prime_emb = einops.rearrange(prime_emb, "b t d -> b d t")
+            t_emb = self.t_enc(prime_emb)
+            t_emb = einops.repeat(t_emb, "b d t  -> b d (t repeat)",repeat=latent.shape[-1])
+            rest_emb = latent
+            self.rest_emb = rest_emb
+
+            if self.training_params["decoder_type"] == "transformer":
+                t_emb = einops.rearrange(t_emb, "b d t -> b t d")
+
+            dec_input = torch.cat((latent,p_prime_latent, t_emb), dim=1)
+            z_hat = self.dec(dec_input)
+        
+        if self.training_params["disentangle"] == "decoder":
+            rest_emb = latent 
+            self.rest_emb = rest_emb
+            dec_input = latent
+
+            z_hat = self.dec(dec_input, p_prime_latent)
+
+        if self.training_params["loss_type"] == "mse":
+            loss = MSE_loss
+            target = z
+            target_prime = z_prime
+        else:
+            loss = C_loss
+            target = z_codes
+            target_prime = z_prime_codes
+
+        # token_predict_loss = torch.tensor(0.0).to(self.device)
+        # indices = []
+        # #project to lower dimensions
+        # for i in range(9):
+        #     i_latent = z_hat[:, :, i, :]
+        #     i_latent = dacModel.quantizer.quantizers[i].in_proj(i_latent)
+        #     encodings = einops.rearrange(i_latent, "b d t -> (b t) d")
+        #     targets = einops.rearrange(z_codes[:,i,:], "b t -> (b t)")
+        #     codebook = dacModel.quantizer.quantizers[i].codebook.weight # codebook: (N x D)
+
+        #     # L2 normalize encodings and codebook (ViT-VQGAN)
+        #     encodings = F.normalize(encodings)
+        #     codebook = F.normalize(codebook)
+
+        #     # Compute euclidean distance with codebook
+        #     dist = (
+        #         encodings.pow(2).sum(1, keepdim=True)
+        #         - 2 * encodings @ codebook.t()
+        #         + codebook.pow(2).sum(1, keepdim=True).t()
+        #     )
+
+
+        #     prob = F.log_softmax(-dist,dim=1)
+        #     token_predict_loss += C_loss(prob, targets).mean()
+        #     code = einops.rearrange(torch.argmax(prob, dim=1), "(b t) -> b t", b=z.shape[0])
+        #     indices.append(code)
+
+        # z_hat = torch.stack(indices, dim=1)
+
         # z_hat = einops.rearrange(dacModel.quantizer(z_hat)[1], "b c t -> b t c")
 
         # emb_list = []
@@ -275,33 +753,47 @@ class new_model(nn.Module):
 
         # z_hat = torch.cat(emb_list, dim=2) 
 
+        #make contiguous
+        z_hat = z_hat.contiguous()
 
-        #loss categorical and regression loss functions
-        C_loss = nn.NLLLoss(reduction='none')
-        COS_loss = nn.CosineEmbeddingLoss()
-        MSE_loss = nn.MSELoss()
+        if self.training_params["codes"] == "flattened":
+            z_hat = z_hat[:,:,0,:]
+
+        if self.training_params["input_type"] == "continuous":
+            z_hat = z_hat[:,:,0,:]
 
         #categorical reconstruction loss
-        token_predict_loss = C_loss(z_hat, z_prime_codes)
-        # token_predict_loss = MSE_loss(z_hat, z_prime)
+        if self.training_params["reconstruction"] == "same":
+            token_predict_loss = loss(z_hat, target)
+        else:
+            token_predict_loss = loss(z_hat, target_prime)
 
-        
-        #cosine loss between p_latent and rest lantent and between p_prime latent and rest latent
-        cosine_loss = COS_loss(p_latent.reshape(p_latent.shape[0], p_latent.shape[1]*p_latent.shape[2]), rest_emb.reshape(rest_emb.shape[0], rest_emb.shape[1]*rest_emb.shape[2]), torch.full((rest_emb.shape[0],), -1).to(self.device))
-        cosine_loss += COS_loss(p_prime_latent.reshape(p_prime_latent.shape[0], p_prime_latent.shape[1]*p_prime_latent.shape[2]), rest_emb.reshape(rest_emb.shape[0], rest_emb.shape[1]*rest_emb.shape[2]), torch.full((rest_emb.shape[0],), -1).to(self.device))
+        cosine_loss = torch.tensor(0.0).to(self.device)
+
+        #cosine loss only if disentangling
+        if self.training_params["disentangle"] != None:
+            if self.training_params["cosine_loss"]:
+                if self.training_params["disentangle"] != "concat" and  self.training_params["disentangle"] != "conv_single":
+                    cosine_loss = COS_loss(p_latent.reshape(p_latent.shape[0], p_latent.shape[1]*p_latent.shape[2]), rest_emb.reshape(rest_emb.shape[0], rest_emb.shape[1]*rest_emb.shape[2]), torch.full((rest_emb.shape[0],), -1).to(self.device))
+                cosine_loss += COS_loss(p_prime_latent.reshape(p_prime_latent.shape[0], p_prime_latent.shape[1]*p_prime_latent.shape[2]), rest_emb.reshape(rest_emb.shape[0], rest_emb.shape[1]*rest_emb.shape[2]), torch.full((rest_emb.shape[0],), -1).to(self.device))
 
         #weight the loss per hierarchical token
-        token_predict_loss *= torch.linspace(1,0.1,9).to(self.device)[None, :, None]
-        token_predict_loss = token_predict_loss.mean()
+        if self.training_params["loss_type"] == "hierarchical_nll":
+            token_predict_loss *= torch.linspace(1,0.1,9).to(self.device)[None, :, None]
+            token_predict_loss = token_predict_loss.mean()
 
-        z_hat = torch.argmax(z_hat, dim=1)
+        if self.training_params["input_type"] != "continuous":
+            z_hat = torch.argmax(z_hat, dim=1)
         # z_hat = dacModel.quantizer(z_hat)[1]
 
+        if self.training_params["codes"] == "flattened":
+            z_hat = z_hat.unflatten(-1, (9,-1))
 
         loss = {"t_predict": token_predict_loss,
-                "cosine": cosine_loss}
+                "cosine": cosine_loss,
+                "emb": emb_loss}
 
-        predict = {"z" : z_hat,}
+        predict = {"z" : z_hat}
 
         return loss, predict
 

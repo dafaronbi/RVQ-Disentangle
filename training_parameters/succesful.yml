@@ -1,0 +1,63 @@
+lr: 0.002
+save_path: saved_models/dis_transformer_dec_limitMOREnull.pt
+tb_path: tensorboard/long
+data_path: 
+  - data/train_tensor_JC_0.pt
+  - data/train_tensor_JC_1.pt
+  - data/train_tensor_JC_2.pt
+  - data/train_tensor_JC_3.pt
+  - data/train_tensor_JC_4.pt
+  - data/train_tensor_JC_5.pt
+  - data/train_tensor_JC_6.pt
+  - data/train_tensor_JC_7.pt
+  - data/train_tensor_JC_8.pt
+  - data/train_tensor_JC_9.pt
+  - data/train_tensor_JC_10.pt
+  - data/train_tensor_JC_11.pt
+  - data/train_tensor_JC_12.pt
+  - data/train_tensor_JC_13.pt
+  - data/train_tensor_JC_14.pt
+  - data/train_tensor_JC_15.pt
+  - data/train_tensor_JC_16.pt
+  - data/train_tensor_JC_17.pt
+  - data/train_tensor_JC_18.pt
+  - data/train_tensor_JC_19.pt
+  - data/train_tensor_JC_20.pt
+  - data/train_tensor_JC_21.pt
+  - data/train_tensor_JC_22.pt
+  - data/train_tensor_JC_23.pt
+  # - data/test_tensor_JC_0.pt
+validation_data_path:
+  # - data/test_tensor_JC_0.pt
+  - data/valid_tensor_JC_0.pt
+  - data/valid_tensor_JC_1.pt
+test_data_path: 
+  - data/test_tensor_JC_0.pt
+  # - data/train_tensor_JC_0.pt
+batch_size: 400
+v_frequency: 10
+verbos: True
+encoder_epochs: 1000
+train_encoder: False
+train_continue: False
+epochs: 500
+instruments: null #[759] #[759, 417, 644, 97] #, 43, 701, 123, 37, 701, 488, 914, 224, 572, 82] #, 327] [771]
+num_workers: 0
+emb_dim: 512
+encoder_type: null
+num_enc_layers: 1
+decoder_type: "transformer_decoder"
+loss_type: "hierarchical_nll"
+disentangle: "decoder"
+d_conv_size: null
+n_FiLM: null
+reconstruction: "disentangle"
+sample: "instrument"
+num_dec_layers: 2
+input_type: "discrete"
+codes: "unchanged"
+codebook: "learned"
+input_dim: null
+cosine_loss: False
+num_heads: 64
+c_length: null
