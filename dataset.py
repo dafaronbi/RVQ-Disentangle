@@ -26,11 +26,14 @@ import random
 def multi_threaded_file_reader(file_paths):
     threads = []
     results = []
+    data_dict = {}
 
     # Define the worker function
     def read_file_thread(file_path):
         result = torch.load(file_path, map_location=torch.device('cpu'))
-        results.extend(result)
+        data_dict[int(file_path.split("_")[-1][:-3])] = result
+        # results.extend(result)
+        
 
     # Create and start threads
     for file_path in file_paths:
@@ -41,6 +44,9 @@ def multi_threaded_file_reader(file_paths):
     # Wait for all threads to finish
     for thread in threads:
         thread.join()
+
+    for i in sorted(data_dict.keys()):
+        results.extend(data_dict[i])
 
     return results
 
@@ -226,7 +232,7 @@ class NSynth_transform_ram(data.Dataset):
             Each field value will be encoding as an integer using sklearn
             LabelEncoder.
     """
-    def __init__(self, files, instruments=None):
+    def __init__(self, files, instruments=None, velocities=None, sample="instrument"):
         """Constructor"""
         self.data = multi_threaded_file_reader(files)
 
@@ -241,9 +247,17 @@ class NSynth_transform_ram(data.Dataset):
         self.rms_max = 0.9348938465118408
         self.rms_min = 0
 
+        if sample == None:
+            self.sample_method = "instrument"
+        else:
+            self.sample_method = sample
+
         #filter instrument
         if instruments:
             self.data = [ d for d in self.data if d[1]["instrument"] in instruments]
+        
+        if velocities:
+            self.data = [ d for d in self.data if d[1]["velocity"] in velocities]
             
         # if torch.distributed.get_rank() == 0:
         print(len(self.data))
@@ -264,20 +278,25 @@ class NSynth_transform_ram(data.Dataset):
         #get first item by index
         data = self.data[index]
 
-        # #get random second data point
-        # r_index = random.randint(0, len(self)-1)
-        # r_data = self.data[r_index]
+        #get random second data point
+        if self.sample_method == "random":
+            r_index = random.randint(0, len(self)-1)
+            r_data = self.data[r_index]
 
         # print(data[1]["instrument"])
 
-        i_data = self.data[index-75:index+75]
-        i_data = [ d for d in i_data if d[1]["instrument"] in [data[1]["instrument"]]]
+        if self.sample_method == "instrument":
+            #get random data point of same instrument
+            i_data = self.data[index-75:index+75]
+            i_data = [ d for d in i_data if d[1]["instrument"] in [data[1]["instrument"]]]
+            i_data = [ d for d in i_data if d[1]["pitch"].item() in range(36,47)]
+            i_data = [ d for d in i_data if d[1]["velocity"] in [data[1]["velocity"]]]
 
-        if len(i_data):
-            r_index = random.randint(0, len(i_data)-1)
-            r_data = i_data[r_index]
-        else:
-            r_data = data
+            if len(i_data):
+                r_index = random.randint(0, len(i_data)-1)
+                r_data = i_data[r_index]
+            else:
+                r_data = data
 
 
         #input data

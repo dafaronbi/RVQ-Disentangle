@@ -14,7 +14,47 @@ import argparse
 import datetime
 import sklearn
 from sklearn.cluster import KMeans
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import silhouette_score
+import umap
+import pesq
+from torch.utils.data.dataset import Dataset
+from torch.utils.data.sampler import Sampler
+from typing import Iterator, Optional, TypeVar
 
+class PitchRangeSampler(Sampler[int]):
+    r"""Samples elements sequentially, always in the same order.
+
+    Args:
+        dataset (Dataset): dataset to sample from
+    """
+
+    def __init__(self, dataset: torch.utils.data.Dataset, shuffle: bool = True, pitch_range: list = list(range(36,47))) -> None:
+        self.dataset = dataset
+        self.shuffle = shuffle
+        self.pitch_range = pitch_range 
+
+    def __iter__(self) -> Iterator[int]:
+
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            seed = int(torch.empty((), dtype=torch.int64).random_().item())
+            g.manual_seed(seed)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()  # type: ignore[arg-type]
+        else:
+            indices = list(range(len(self.dataset)))
+        
+        indices_to_keep = list()
+        
+        for idx in indices:
+            if self.dataset[idx][1].item() in self.pitch_range:
+                indices_to_keep.append(idx)
+        
+        return iter(indices_to_keep)
+
+    def __len__(self) -> int:
+        return len(self.data_source)
 
 def grab_buffer(fig):
     data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
@@ -66,11 +106,26 @@ def make_rms_img(rms):
 
     return grab_buffer(fig)
 
+def calculate_pesq(pred, target, sr=441000):
+    pred = librosa.resample(pred.detach().cpu().numpy(), orig_sr=sr, target_sr=16000)
+    target = librosa.resample(target.detach().cpu().numpy(), orig_sr=sr, target_sr=16000)
+
+    pesq_score = pesq.pesq(16000, pred, target, on_error=pesq.PesqError.RETURN_VALUES)
+    
+    #error scores = zero 
+    if pesq_score < 0:
+        pesq_score = 0
+
+    return pesq_score
+
 parser = argparse.ArgumentParser(description='Data Directory')
 parser.add_argument('-e', '--experiments', help="experiments to run", default="")
 parser.add_argument('-m', '--model', help="model to test", default="saved_models/disentangle.pt")
 parser.add_argument('-d', '--dataset', help="dataset to run inference", type=lambda s: [item for item in s.split(' ')], default=["data/test_tensor_JC_0.pt"])
 parser.add_argument('-i', '--instruments', help="instruments of dataset", type=lambda s: [int(item) for item in s.split(' ')], default=None)
+parser.add_argument('-b', '--batch_size', help="batch_size of dataloader", type=int, default=100)
+parser.add_argument('-r', '--recon', help="reconstructing input signal (same) or prime signal (disentangle)", default="same")
+parser.add_argument('-in', '--input_t', help="discrete or continuous input type", default="discrete")
 args = parser.parse_args()
 
 
@@ -81,17 +136,19 @@ gpu_count = torch.cuda.device_count()
 # disentangle = model.disentangle(device=device).to(device)
 disentangle = torch.load(args.model, map_location=device).to(device)
 # disentangle.load_state_dict(torch.load("saved_models/BEST_disentangle.pt").state_dict()) 
-disentangle.device = device
 disentangle.eval()
 
-# print(disentangle)
+# for module in disentangle.modules():
+#     print(module)
 # exit()
 
 #log for tensorboard
-writer = SummaryWriter("tensorboard/inference_runs/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+writer = SummaryWriter("tensorboard/inference_runs/" +  args.model[13:-3] + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
-data = dataset.NSynth_transform_ram(args.dataset,instruments=args.instruments)
-test_loader = torch.utils.data.DataLoader(data, batch_size=len(data), shuffle=True, drop_last=True, num_workers=0*gpu_count)
+data = dataset.NSynth_transform_ram(args.dataset,instruments=args.instruments, velocities=[127])
+test_loader = torch.utils.data.DataLoader(data, batch_size=args.batch_size, sampler=PitchRangeSampler(data), drop_last=True, num_workers=0*gpu_count)
+v_data = dataset.NSynth_transform_ram(args.dataset, instruments=None)
+valid_loader = torch.utils.data.DataLoader(v_data, batch_size=args.batch_size, sampler=PitchRangeSampler(v_data), drop_last=False, num_workers=0*gpu_count)
 
 #create DAC encoder and decoder
 model_path = dac.utils.download(model_type="44khz")
@@ -112,6 +169,129 @@ mfcc_prime = mfcc_prime.to(device)
 rms_prime = rms_prime.to(device)
 inst_prime = inst_prime.to(device)
 
+if "test_reconstruct_accuracy" in args.experiments:
+    
+    v_nll_total = 0
+    v_accuracy_total = 0
+    v_accuracy_0_total = 0
+    v_accuracy_1_total = 0
+    v_accuracy_2_total = 0
+    v_accuracy_3_total = 0
+    v_accuracy_4_total = 0
+    v_accuracy_5_total = 0
+    v_accuracy_6_total = 0
+    v_accuracy_7_total = 0
+    v_accuracy_8_total = 0
+    v_pesq_total = 0
+    v_pesq_std_total = 0
+    v_cosine_total = 0
+    v_emb_total = 0
+
+    #evaluate mode
+    disentangle.eval()
+
+    rest_emb = torch.zeros((0, 512)).to(device)
+
+    for (batch_idx, train_tensors) in enumerate(test_loader):
+        z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = train_tensors   
+
+        z = z.to(device)[:,0,:,:]
+        p = p.to(device)
+        z_prime = z_prime.to(device)[:,0,:,:]
+        p_prime = p_prime.to(device)
+        l,p= disentangle(model, z,p,z_prime, p_prime)
+
+        if args.recon == "same":
+            target_z = z
+        if args.recon == "disentangle":
+            target_z = z_prime
+        
+        rest_emb = torch.cat((rest_emb, torch.sum(disentangle.rest_emb, dim=2)), dim=0)
+
+        v_pesq_array = []
+        #calculate pesq of each audio sample
+        with torch.no_grad():
+            for i,z_sample in enumerate(target_z):
+                print(i)
+                if args.input_t == "continuous":
+                    o_emb = p["z"][i].unsqueeze(0)
+                else:
+                    o_emb = model.quantizer.from_codes(p["z"][i].unsqueeze(0))[0]
+                    # o_emb = model.quantizer.from_codes(torch.randint(0,1024, (1,9,344)).to(device))[0]
+
+                i_emb = model.quantizer.from_codes(z_sample.unsqueeze(0))[0]
+                
+                # o_emb = p["z"][i].unsqueeze(0)
+                i_audio = model.decode(i_emb)
+                o_audio = model.decode(o_emb)
+                v_pesq_array.append(calculate_pesq(i_audio[0][0], o_audio[0][0]))
+
+        v_pesq_add = torch.tensor(v_pesq_array).sum()
+        # v_pesq_std = torch.tensor(v_pesq_array).std()
+        
+
+        #normalize pesq score
+        v_pesq_total = v_pesq_total + ( (v_pesq_add - v_pesq_total) / len(z))
+        # v_pesq_std_total = v_pesq_std_total + ( (v_pesq_std - v_pesq_total) / len(z))
+        
+        if args.input_t == "continuous":
+            token_acc = torch.full_like(target_z, False)
+        else:
+            token_acc = (p["z"] == target_z)
+            # token_acc = (torch.randint(0,1024, z_prime.shape).to(device) == target_z)
+
+        #get negative log likelihood loss
+        v_nll_total += l["t_predict"].item()
+        v_cosine_total += l["cosine"].item()
+        v_emb_total += l["emb"].item()
+ 
+        v_nll_total += 0
+        v_cosine_total += 0
+        v_emb_total += 0
+
+        #get total accuracy
+        v_accuracy_total += ((torch.count_nonzero(token_acc) / torch.numel(z_prime))*100).item()
+
+        #calculate accuracy per  token
+        v_accuracy_0_total += ((torch.count_nonzero(token_acc[:, 0, :]) / torch.numel(z_prime[:, 0, :]))*100).item()
+        v_accuracy_1_total += ((torch.count_nonzero(token_acc[:, 1, :]) / torch.numel(z_prime[:, 1, :]))*100).item()
+        v_accuracy_2_total += ((torch.count_nonzero(token_acc[:, 2, :]) / torch.numel(z_prime[:, 2, :]))*100).item()
+        v_accuracy_3_total += ((torch.count_nonzero(token_acc[:, 3, :]) / torch.numel(z_prime[:, 3, :]))*100).item()
+        v_accuracy_4_total += ((torch.count_nonzero(token_acc[:, 4, :]) / torch.numel(z_prime[:, 4, :]))*100).item()
+        v_accuracy_5_total += ((torch.count_nonzero(token_acc[:, 5, :]) / torch.numel(z_prime[:, 5, :]))*100).item()
+        v_accuracy_6_total += ((torch.count_nonzero(token_acc[:, 6, :]) / torch.numel(z_prime[:, 6, :]))*100).item()
+        v_accuracy_7_total += ((torch.count_nonzero(token_acc[:, 7, :]) / torch.numel(z_prime[:, 7, :]))*100).item()
+        v_accuracy_8_total += ((torch.count_nonzero(token_acc[:, 8, :]) / torch.numel(z_prime[:, 8, :]))*100).item()
+    
+    if args.instruments:
+        num_instruments = len(args.instuments)
+    else:
+        num_instruments = 53
+
+    kmeans = KMeans(n_clusters=num_instruments, random_state=42)
+    s_score = silhouette_score(rest_emb.detach().cpu().numpy(), kmeans.fit_predict(rest_emb.detach().cpu().numpy()))
+    
+    writer.add_scalar("Validation/NLL Loss", v_nll_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy", v_accuracy_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy Token 0", v_accuracy_0_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy Token 1", v_accuracy_1_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy Token 2", v_accuracy_2_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy Token 3", v_accuracy_3_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy Token 4", v_accuracy_4_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy Token 5", v_accuracy_5_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy Token 6", v_accuracy_6_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy Token 7", v_accuracy_7_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/Accuracy Token 8", v_accuracy_8_total / len(valid_loader), 0)
+    writer.add_scalar("Validation/PESQ", v_pesq_total / len(valid_loader), 0)
+    # writer.add_scalar("Validation/PESQ_STD", v_pesq_std_total / len(valid_loader), epoch)
+    writer.add_scalar("Validation/Cosine", v_cosine_total/ len(valid_loader), 0)
+    writer.add_scalar("Validation/Emb Loss", v_emb_total/ len(valid_loader), 0)
+    writer.add_scalar("Validation/Silhouette Score", s_score, 0)
+
+    writer.flush()
+
+    exit()
+
 if "test_reconstruct" in args.experiments:
     print("<============test_reconstruct==================>")
     l,predict = disentangle(model, z,p,z_prime,p_prime)
@@ -119,18 +299,47 @@ if "test_reconstruct" in args.experiments:
     z_prime_codes = z_prime
     z_prime = model.quantizer.from_codes(z_prime_codes[0].unsqueeze(0))[0]
 
+    z_codes = z
+    z = model.quantizer.from_codes(z_codes[0].unsqueeze(0))[0]
+
     out_codes = predict["z"]
-    out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
+    
+
+    if args.input_t == "continuous":
+        out = out_codes
+    else:
+        out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
 
     with torch.no_grad():
-        input_audio = model.decode(z_prime)
+        z_prime_audio = model.decode(z_prime)
+        z_audio = model.decode(z)
         output_audio = model.decode(out)
 
     
-    writer.add_audio(f"Audio/Ground Truth:"  , input_audio[0])
+    writer.add_audio(f"Audio/Ground Truth:"  , z_audio[0])
+    writer.add_audio(f"Audio/Ground Truth Prime:"  , z_prime_audio[0])
     writer.add_audio(f"Audio/Reconstruction" , output_audio[0])
 
     writer.flush()
+
+    exit()
+
+if "test_pitch_emb" in args.experiments:
+    print("<============test_pitch_emb==================>")
+
+    #get embedding
+    emb_weights = disentangle.p_enc.weight
+
+    size = 128
+    #make similarity matrix
+    sim_matrix = torch.zeros((size, size))
+    for i in range(size):
+        for j in range(size):
+            sim_matrix[i][j] = torch.abs(torch.dot(emb_weights[i], emb_weights[j]) / (emb_weights[i].norm() * emb_weights[j].norm()))
+
+    plt.matshow(sim_matrix.cpu().detach().numpy())
+    plt.colorbar()
+    plt.savefig("pitch similairty matrix.pdf")
 
     exit()
 
@@ -148,10 +357,10 @@ if "test_pitch_sweep" in args.experiments:
 
     for p_p in torch.tensor([num for num in [34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,45,46,47,
     48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,
-    75,76,77,78,79,80,81,82,83,84,85,86,87,88,90]]).to(device):
+    75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90]]).to(device):
         l,predict = disentangle(model, z_codes[0].unsqueeze(0),p[0].unsqueeze(0),z_prime[0].unsqueeze(0),p_p.unsqueeze(0))
-        out = predict["z"]
-        # out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
+        out_codes = predict["z"]
+        out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
 
         with torch.no_grad():
             output_audio = model.decode(out)
@@ -159,6 +368,61 @@ if "test_pitch_sweep" in args.experiments:
         writer.add_audio(f"Audio/Reconstruction pitch={p_p.item()}" , output_audio[0])
 
     writer.flush()
+
+    exit()
+
+if "test_rest_eval" in args.experiments:
+    print("<============test_rest_eval==================>")
+    i_to_family = {128: 1, 642: 3, 387: 7, 644: 5, 65: 4, 8: 6, 905: 4, 656: 0, 914: 0, 150: 0, 921: 6, 414: 1, 927: 0, 
+    417: 0, 675: 8, 420: 0, 37: 10, 40: 4, 43: 1, 46: 10, 50: 4, 436: 8, 183: 7, 440: 6, 572: 1, 701: 6, 958: 6, 577: 4, 
+    450: 8, 488: 5, 838: 4, 327: 4, 457: 3, 590: 5, 82: 2, 803: 0, 609: 8, 86: 2, 219: 3, 805: 4, 224: 7, 97: 8, 100: 8, 
+    263: 3, 872: 0, 316: 3, 880: 0, 104: 7, 759: 0, 121: 1, 378: 3, 123: 6, 510: 3}
+    num_to_instrument = {0: "bass", 1 : "brass", 2 : "flute", 3 : "guitar", 4 : "keyboard", 5 : "mallet", 6 : "organ", 7 : "reed", 
+    8 : "string", 9 : "synth_lead", 10 : "vocal"}
+
+    rest_emb = torch.zeros((0,32,111))
+    insts = torch.zeros((0))
+    inst_families = []
+
+    for test_tensors in test_loader:
+        z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = test_tensors
+        z = z.to(device)[:,0,:,:]
+        p = p.to(device)
+        inst = inst.to(device)
+        z_prime = z_prime.to(device)[:,0,:,:]
+        p_prime = p_prime.to(device)
+        inst_prime = inst_prime.to(device)
+
+        disentangle(model, z,p,z_prime,p_prime)
+        rest_emb = torch.cat((rest_emb, disentangle.rest_emb), dim=0)
+        insts = torch.cat((insts, inst), dim=0)
+    
+    for s in insts:
+        inst_families.append(i_to_family[s.item()])
+
+    reducer = umap.UMAP(n_neighbors=200)
+
+    # d_redux = TSNE(n_components=2, learning_rate='auto',init='random', perplexity=2000, n_iter=5000).fit_transform(rest_emb.mean(2).cpu().detach().numpy())
+    d_redux = reducer.fit_transform(rest_emb.mean(2).cpu().detach().numpy())
+
+    fig, ax = plt.subplots()
+
+    #class to distribute points
+    c = insts.cpu().detach().numpy()
+    # c = inst_families
+
+    reg = LinearRegression().fit(rest_emb.mean(2).cpu().detach().numpy(), insts.cpu().detach().numpy())
+    print(reg.score(rest_emb.mean(2).cpu().detach().numpy(), insts.cpu().detach().numpy()))
+
+    for i in np.unique(c):
+        ix = np.where(c == i)
+        # ax.scatter(d_redux.T[0][ix], d_redux.T[1][ix],label=num_to_instrument[i])
+        ax.scatter(d_redux.T[0][ix], d_redux.T[1][ix])
+    
+    ax.set(title='Rest Embedding UMAP scatter plot per instrument')
+    ax.legend()
+    fig.canvas.draw()
+    fig.savefig("output_image.png")
 
     exit()
 
