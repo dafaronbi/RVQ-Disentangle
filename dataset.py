@@ -363,15 +363,10 @@ class NSynthWavTokenizerPair(torch.utils.data.Dataset):
     Each .pt file is named: instrument-pitch-velocity.pt and contains z.
     Returns: z, pitch, z_prime, pitch_prime
     """
-    def __init__(self, file_paths_or_dir):
-        # If a directory is given, glob all .pt files
-        if isinstance(file_paths_or_dir, str) and os.path.isdir(file_paths_or_dir):
-            self.file_paths = sorted(glob.glob(os.path.join(file_paths_or_dir, "*.pt")))
-        elif isinstance(file_paths_or_dir, list):
-            self.file_paths = file_paths_or_dir
-        else:
-            raise ValueError("Input must be a directory path or a list of file paths.")
-
+    def __init__(self, directory):
+        # Always glob all .pt files in the given directory
+        directory = directory[0]
+        self.file_paths = sorted(glob.glob(os.path.join(directory, "*.pt")))
         self.data = []
         self.instrument_to_indices = {}
 
@@ -381,11 +376,16 @@ class NSynthWavTokenizerPair(torch.utils.data.Dataset):
             base = fname[:-3] if fname.endswith('.pt') else fname
             parts = base.split('-')
             if len(parts) < 3:
-                raise ValueError(f"Filename {fname} does not match expected format instrument-pitch-velocity.pt")
-            instrument, pitch, velocity = parts[0], int(parts[1]), int(parts[2])
+                print(f"Skipping file with unexpected name: {fname}")
+                continue
+            try:
+                instrument, pitch, velocity = parts[0], int(parts[1]), int(parts[2])
+            except ValueError:
+                print(f"Skipping file with non-integer pitch/velocity: {fname}")
+                continue
             z = torch.load(path, map_location='cpu')
             self.data.append({'z': z, 'instrument': instrument, 'pitch': pitch})
-            self.instrument_to_indices.setdefault(instrument, []).append(idx)
+            self.instrument_to_indices.setdefault(instrument, []).append(len(self.data)-1)
 
     def __len__(self):
         return len(self.data)

@@ -227,7 +227,103 @@ class transformer_decoder_block(nn.Module):
         output = self.proj(output)
         
         return output
+    
+class wavtokenizer_model(nn.Module):
+    def __init__(self, device, parameters):
+        super().__init__()
+        self.device = device
+        self.training_params = parameters
+        self.emb_dim = self.training_params["emb_dim"]
+        self.num_heads = self.training_params["num_heads"]
 
+        # Set input embedding dim
+        if self.training_params["codebook"] == "learned":
+            self.input_emb_dim = 512
+        elif self.training_params["codebook"] == "default":
+            self.input_emb_dim = 1024
+        else:
+            self.input_emb_dim = 512  # fallback
+
+        self.p_enc = torch.nn.Embedding(128, self.emb_dim)
+        self.proj_matrix_wavtokenizer = [torch.nn.Embedding(4096, self.input_emb_dim).to(self.device)]
+
+        # Encoder: simple 1D conv, can be replaced as needed
+        self.enc = nn.Sequential(
+            nn.Conv1d(self.input_emb_dim, self.emb_dim, kernel_size=3, stride=1, padding=1, dilation=1),
+            bNorm(self.emb_dim, self.device),
+            nn.ReLU(),
+        )
+
+        # Decoder: transformer decoder block, output [B, 4096, T]
+        self.dec_wavtokenizer = transformer_decoder_block(
+            d_model=self.emb_dim,
+            output_size=4096,
+            num_heads=self.num_heads,
+            num_layers=self.training_params["num_dec_layers"],
+            device=self.device
+        )
+
+    def forward(self, z, p, z_prime, p_prime):
+        # z: (B, 1, 1, T)
+        # p: (B,)
+        # z_prime: (B, 1, 1, T)
+        # p_prime: (B,)
+
+        C_loss = nn.NLLLoss()
+
+        # Remove extra dimensions: (B, 1, 1, T) -> (B, T)
+        z_codes = z.squeeze(1).squeeze(1)         # (B, T)
+        z_prime_codes = z_prime.squeeze(1).squeeze(1)  # (B, T)
+        print("z_codes min:", z_codes.min().item(), "max:", z_codes.max().item())
+        assert z_codes.min() >= 0 and z_codes.max() < 4096, "z_codes out of bounds!"
+
+        # Project codes to embedding dimension
+        d_emb = self.proj_matrix_wavtokenizer[0](z_codes)  # (B, T, emb_dim)
+        d_emb = d_emb.permute(0, 2, 1)  # (B, emb_dim, T)
+
+        # Pitch embedding
+        c_length = d_emb.shape[-1]
+        p = einops.repeat(p, "b -> b (t)", t=c_length)
+        p_prime = einops.repeat(p_prime, "b -> b (t)", t=c_length)
+        p_latent = einops.rearrange(self.p_enc(p), "b t d -> b d t")
+        p_prime_latent = einops.rearrange(self.p_enc(p_prime), "b t d -> b d t")
+
+        # Disentanglement logic
+        latent = self.enc(d_emb)
+        if self.training_params.get("disentangle", None) == "subtract":
+            rest_emb = latent - p_latent
+            dec_input = rest_emb + p_prime_latent
+        else:
+            dec_input = latent
+
+        # Decoder
+        if self.training_params.get("decoder_type", "") == "transformer_decoder":
+            z_hat = self.dec_wavtokenizer(dec_input, p_prime_latent)
+        else:
+            z_hat = self.dec_wavtokenizer(dec_input)
+
+        # Ensure output is [B, 4096, T]
+        if z_hat.dim() == 4 and z_hat.shape[2] == 1:
+            z_hat = z_hat.squeeze(2)
+        elif z_hat.dim() == 4 and z_hat.shape[2] > 1:
+            z_hat = z_hat[:, :, 0, :]  # Use first codebook if needed
+
+        print("z_hat shape", z_hat.shape)
+        print("z_prime_codes shape:", z_prime_codes.shape)
+
+        # Loss
+        token_predict_loss = C_loss(z_hat, z_prime_codes)
+        cosine_loss = torch.tensor(0.0).to(self.device)
+        emb_loss = torch.tensor(0.0).to(self.device)
+
+        loss = {
+            "t_predict": token_predict_loss,
+            "cosine": cosine_loss,
+            "emb": emb_loss
+        }
+        predict = {"z": z_hat.argmax(dim=1).view(z_hat.shape[0], 1, 1, z_hat.shape[-1])}
+
+        return loss, predict
         
 class new_model(nn.Module):
     def __init__(self, device, parameters):
@@ -452,12 +548,15 @@ class new_model(nn.Module):
         
         if self.training_params["decoder_type"] == "transformer_decoder":
             self.dec = transformer_decoder_block(d_size, 1024*9, self.num_heads, self.training_params["num_dec_layers"], self.device)
+            self.dec_wavtokenizer = transformer_decoder_block(d_size, 4096, self.num_heads, self.training_params["num_dec_layers"], self.device)
         
         if self.training_params["decoder_type"] == "cross_attention":
             self.dec = cross_attention_block(d_size, 1024*9, self.num_heads, self.device)
+            self.dec_wavtokenizer = cross_attention_block(d_size, 4096, self.num_heads, self.device)
 
 
         self.proj_matrix = [torch.nn.Embedding(1025,self.input_emb_dim).to(self.device) for i in range(9)]
+        self.proj_matrix_wavtokenizer = [torch.nn.Embedding(4096,self.input_emb_dim).to(self.device) for i in range(1)]
 
         if  self.training_params["disentangle"] == "conv" or self.training_params["disentangle"] == "conv_single":
             k_size = self.training_params["d_conv_size"]
@@ -482,9 +581,71 @@ class new_model(nn.Module):
             )
 
         self.filter_generator = FilterGenerator(32, 32, 1, 32)
+    
+    # Forward to Wavtokenizer
+    def forward(self, z, p, z_prime, p_prime):
+        # z: (B, 1, 1, 300)
+        # p: (B,)
+        # z_prime: (B, 1, 1, 300)
+        # p_prime: (B,)
+
+        C_loss = nn.NLLLoss()
+        COS_loss = nn.CosineEmbeddingLoss()
+        MSE_loss = nn.MSELoss()
+
+        # Remove extra dimensions: (B, 1, 1, 300) -> (B, 300)
+        z_codes = z.squeeze(1).squeeze(1)  # (B, 300)
+        z_prime_codes = z_prime.squeeze(1).squeeze(1)  # (B, 300)
+        print("z_codes min:", z_codes.min().item(), "max:", z_codes.max().item())
+        assert z_codes.min() >= 0 and z_codes.max() < 4096, "z_codes out of bounds!"
+
+        # Project codes to embedding dimension
+        # If using learned codebook:
+        d_emb = self.proj_matrix_wavtokenizer[0](z_codes)  # (B, 300, emb_dim)
+        d_emb = d_emb.permute(0, 2, 1)        # (B, emb_dim, 300)
+
+        # Pitch embedding
+        c_length = d_emb.shape[-1]
+        p = einops.repeat(p, "b -> b (t)", t=c_length)
+        p_prime = einops.repeat(p_prime, "b -> b (t)", t=c_length)
+        p_latent = einops.rearrange(self.p_enc(p), "b t d -> b d t")
+        p_prime_latent = einops.rearrange(self.p_enc(p_prime), "b t d -> b d t")
+
+        # Disentanglement logic (example: subtract)
+        latent = self.enc(d_emb)
+        if self.training_params.get("disentangle", None) == "subtract":
+            rest_emb = latent - p_latent
+            dec_input = rest_emb + p_prime_latent
+            if self.training_params.get("decoder_type", "") == "transformer_decoder":
+                z_hat = self.dec_wavtokenizer(dec_input, p_prime_latent)
+            else:
+                z_hat = self.dec_wavtokenizer(dec_input)
+        else:
+            dec_input = latent
+            if self.training_params.get("decoder_type", "") == "transformer_decoder":
+                z_hat = self.dec_wavtokenizer(dec_input, p_prime_latent)
+            else:
+                z_hat = self.dec_wavtokenizer(dec_input)
+                
+        print("z_hat shape", z_hat.shape)
+        print("z_prime_codes shape:", z_prime_codes.shape)
+
+        # Loss
+        token_predict_loss = C_loss(z_hat, z_prime_codes)
+        cosine_loss = torch.tensor(0.0).to(self.device)
+        emb_loss = torch.tensor(0.0).to(self.device)
+
+        loss = {
+            "t_predict": token_predict_loss,
+            "cosine": cosine_loss,
+            "emb": emb_loss
+        }
+        predict = {"z": z_hat}
+
+        return loss, predict
         
     
-    def forward(self, dacModel, z,p, z_prime,p_prime):
+    def forward_dac(self, dacModel, z,p, z_prime,p_prime):
 
         #loss categorical and regression loss functions
         if self.training_params["loss_type"] == "hierarchical_nll":

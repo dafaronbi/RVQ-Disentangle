@@ -2,11 +2,11 @@ lr: 0.001
 save_path: saved_models/disentangle.pt
 tb_path: tensorboard/disentangle
 data_path:
-  - /vast/pdt9929/datasets/nsynth/nsynth-valid/wav-tokenizer-codes
+  - /vast/pdt9929/datasets/nsynth/nsynth-valid/wav-tokenizer-codes/
 validation_data_path: 
-  - /vast/pdt9929/datasets/nsynth/nsynth-valid/wav-tokenizer-codes
+  - /vast/pdt9929/datasets/nsynth/nsynth-valid/wav-tokenizer-codes/
 test_data_path: 
-  - /vast/pdt9929/datasets/nsynth/nsynth-test/wav-tokenizer-codes
+  - /vast/pdt9929/datasets/nsynth/nsynth-test/wav-tokenizer-codes/
 batch_size: 200
 v_frequency: 10
 verbos: True

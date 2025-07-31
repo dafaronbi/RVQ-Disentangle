@@ -369,7 +369,7 @@ def main(rank, world_size):
     else:
         s_method = "instrument"
 
-    data = dataset.NSynthWavTokenizerPair(training_params["data_path"], instruments=training_params["instruments"], sample=s_method)
+    data = dataset.NSynthWavTokenizerPair(training_params["data_path"])
     train_loader = torch.utils.data.DataLoader(data, batch_size=batch_size, sampler=PitchRangeSamplerDDP(data), drop_last=False, num_workers=training_params["num_workers"])
     
     if rank == 0:
@@ -379,7 +379,7 @@ def main(rank, world_size):
     if rank == 0:
         print("LOADING VALIDATION DATA...")
         sys.stdout.flush()
-    v_data = dataset.NSynthWavTokenizerPair(training_params["validation_data_path"], instruments=training_params["instruments"], sample=s_method)
+    v_data = dataset.NSynthWavTokenizerPair(training_params["validation_data_path"])
     valid_loader = torch.utils.data.DataLoader(v_data, batch_size=batch_size, sampler=PitchRangeSampler(data), drop_last=False, num_workers=training_params["num_workers"])
 
 
@@ -389,16 +389,11 @@ def main(rank, world_size):
 
     v_frequency = training_params["v_frequency"]
 
-    m = model.new_model(device, training_params).to(device)
+    m = model.wavtokenizer_model(device, training_params).to(device)
     if torch.cuda.device_count() != 0:
         m = DDP(m, device_ids=[device], output_device=device, find_unused_parameters=True)
     else:
         m = DDP(m, find_unused_parameters=True)
-
-    #initialize dac model
-    dac_model_path = dac.utils.download(model_type="44khz")
-    dac_model = dac.DAC.load(dac_model_path).to(device)
-    dac_model.eval()
 
     # Initialize optimizer.
     lr = training_params["lr"]
@@ -430,13 +425,12 @@ def main(rank, world_size):
         loss_total_e = 0
 
         for (batch_idx, train_tensors) in enumerate(train_loader):
-            z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = train_tensors
+            z, p, z_prime, p_prime = train_tensors
             z = z.to(device)[:,0,:,:]
             p = p.to(device)
-            print(z, p)
             z_prime = z_prime.to(device)[:,0,:,:]
             p_prime = p_prime.to(device)
-            l,p = m(dac_model, z,p,z_prime,p_prime)
+            l,p = m(z, p, z_prime, p_prime)
 
             loss = l["t_predict"] + l["cosine"] + l["emb"]
 
