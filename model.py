@@ -187,7 +187,7 @@ class transformer_decoder_block(nn.Module):
         self.device = device
         self.proj = nn.Sequential(
                 nn.Linear(d_model, output_size),
-                Rearrange("b t (d c) -> b d c t", d=1024),
+                Rearrange("b t (d c) -> b d c t", d=output_size),
                 nn.LogSoftmax(dim=1),
         )
         
@@ -255,7 +255,7 @@ class wavtokenizer_model(nn.Module):
         )
 
         # Decoder: transformer decoder block, output [B, 4096, T]
-        self.dec_wavtokenizer = transformer_decoder_block(
+        self.dec = transformer_decoder_block(
             d_model=self.emb_dim,
             output_size=4096,
             num_heads=self.num_heads,
@@ -298,9 +298,9 @@ class wavtokenizer_model(nn.Module):
 
         # Decoder
         if self.training_params.get("decoder_type", "") == "transformer_decoder":
-            z_hat = self.dec_wavtokenizer(dec_input, p_prime_latent)
+            z_hat = self.dec(dec_input, p_prime_latent)
         else:
-            z_hat = self.dec_wavtokenizer(dec_input)
+            z_hat = self.dec(dec_input)
 
         # Ensure output is [B, 4096, T]
         if z_hat.dim() == 4 and z_hat.shape[2] == 1:
