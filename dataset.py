@@ -262,8 +262,6 @@ class NSynth_transform_ram(data.Dataset):
         # if torch.distributed.get_rank() == 0:
         print(len(self.data))
         
-
-
     def __len__(self):
         return len(self.data)
 
@@ -298,7 +296,6 @@ class NSynth_transform_ram(data.Dataset):
             else:
                 r_data = data
 
-
         #input data
         z = data[0]
         p = data[1]["pitch"]
@@ -319,6 +316,98 @@ class NSynth_transform_ram(data.Dataset):
         mfcc = (mfcc - self.mfcc_min) / ( self.mfcc_max -self.mfcc_min)
         
         return [z[0], p[0], mfcc[0], rms[0], inst[0], z_prime[0], p_prime[0], mfcc_prime[0], rms_prime[0], inst_prime[0]]
+    
+class NSynthWavTokenizer(data.Dataset):
+    """
+    Dataset for wavtokenizer codes, where each .pt file contains codes (z).
+    The filename format is assumed to be: instrument-pitch-velocity.pt
+    """
+    def __init__(self, file_paths):
+        """
+        Args:
+            file_paths (list): List of .pt file paths.
+        """
+        self.file_paths = file_paths
+        self.data = []
+        self.meta = []
+
+        for path in self.file_paths:
+            # Extract filename without extension
+            fname = os.path.basename(path)
+            base = fname[:-3] if fname.endswith('.pt') else fname
+            parts = base.split('-')
+            if len(parts) < 3:
+                raise ValueError(f"Filename {fname} does not match expected format instrument-pitch-velocity.pt")
+            instrument, pitch, velocity = parts[0], parts[1], parts[2]
+            z = torch.load(path, map_location='cpu')
+            self.data.append(z)
+            self.meta.append({
+                "instrument": instrument,
+                "pitch": int(pitch),
+                "velocity": int(velocity),
+                "filename": fname
+            })
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        z = self.data[idx]
+        meta = self.meta[idx]
+        return z, meta["instrument"], meta["pitch"], meta["velocity"], meta["filename"]
+
+
+class NSynthWavTokenizerPair(torch.utils.data.Dataset):
+    """
+    Dataset for wavtokenizer codes, returning pairs with the same instrument.
+    Each .pt file is named: instrument-pitch-velocity.pt and contains z.
+    Returns: z, pitch, z_prime, pitch_prime
+    """
+    def __init__(self, file_paths_or_dir):
+        # If a directory is given, glob all .pt files
+        if isinstance(file_paths_or_dir, str) and os.path.isdir(file_paths_or_dir):
+            self.file_paths = sorted(glob.glob(os.path.join(file_paths_or_dir, "*.pt")))
+        elif isinstance(file_paths_or_dir, list):
+            self.file_paths = file_paths_or_dir
+        else:
+            raise ValueError("Input must be a directory path or a list of file paths.")
+
+        self.data = []
+        self.instrument_to_indices = {}
+
+        # Load all codes and metadata
+        for idx, path in enumerate(self.file_paths):
+            fname = os.path.basename(path)
+            base = fname[:-3] if fname.endswith('.pt') else fname
+            parts = base.split('-')
+            if len(parts) < 3:
+                raise ValueError(f"Filename {fname} does not match expected format instrument-pitch-velocity.pt")
+            instrument, pitch, velocity = parts[0], int(parts[1]), int(parts[2])
+            z = torch.load(path, map_location='cpu')
+            self.data.append({'z': z, 'instrument': instrument, 'pitch': pitch})
+            self.instrument_to_indices.setdefault(instrument, []).append(idx)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        pitch = item['pitch']
+        z = item['z']
+
+        # Find another sample with the same instrument (but different index)
+        candidates = self.instrument_to_indices[item['instrument']]
+        candidates = [i for i in candidates if i != idx]
+        if candidates:
+            idx_prime = random.choice(candidates)
+        else:
+            idx_prime = idx  # fallback to self if no other
+
+        item_prime = self.data[idx_prime]
+        z_prime = item_prime['z']
+        pitch_prime = item_prime['pitch']
+
+        return z, torch.tensor(pitch, dtype=torch.long), z_prime, torch.tensor(pitch_prime, dtype=torch.long)
 
 class NSynth_test_bass(data.Dataset):
 
@@ -464,7 +553,6 @@ class NSynth_analysis(data.Dataset):
         # mfcc = (mfcc - self.mfcc_min) / ( self.mfcc_max -self.mfcc_min)
         
         return j
-
 
 if __name__ == "__main__":
     # audio samples are loaded as an int16 numpy array

@@ -356,7 +356,7 @@ def main(rank, world_size):
 
     #get training and validation datasets
     if torch.cuda.device_count() != 0:
-        device = rank
+        device = torch.device(f"cuda:{rank}")
     else:
         device = torch.device('cpu')
 
@@ -369,7 +369,7 @@ def main(rank, world_size):
     else:
         s_method = "instrument"
 
-    data = dataset.NSynth_transform_ram(training_params["data_path"], instruments=training_params["instruments"], sample=s_method)
+    data = dataset.NSynthWavTokenizerPair(training_params["data_path"], instruments=training_params["instruments"], sample=s_method)
     train_loader = torch.utils.data.DataLoader(data, batch_size=batch_size, sampler=PitchRangeSamplerDDP(data), drop_last=False, num_workers=training_params["num_workers"])
     
     if rank == 0:
@@ -379,7 +379,7 @@ def main(rank, world_size):
     if rank == 0:
         print("LOADING VALIDATION DATA...")
         sys.stdout.flush()
-    v_data = dataset.NSynth_transform_ram(training_params["validation_data_path"], instruments=training_params["instruments"], sample=s_method)
+    v_data = dataset.NSynthWavTokenizerPair(training_params["validation_data_path"], instruments=training_params["instruments"], sample=s_method)
     valid_loader = torch.utils.data.DataLoader(v_data, batch_size=batch_size, sampler=PitchRangeSampler(data), drop_last=False, num_workers=training_params["num_workers"])
 
 
@@ -430,9 +430,10 @@ def main(rank, world_size):
         loss_total_e = 0
 
         for (batch_idx, train_tensors) in enumerate(train_loader):
-            z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = train_tensors   
+            z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = train_tensors
             z = z.to(device)[:,0,:,:]
             p = p.to(device)
+            print(z, p)
             z_prime = z_prime.to(device)[:,0,:,:]
             p_prime = p_prime.to(device)
             l,p = m(dac_model, z,p,z_prime,p_prime)

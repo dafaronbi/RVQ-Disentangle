@@ -1,0 +1,36 @@
+lr: 0.001
+save_path: saved_models/disentangle.pt
+tb_path: tensorboard/disentangle
+data_path:
+  - /vast/pdt9929/datasets/nsynth/nsynth-valid/wav-tokenizer-codes
+validation_data_path: 
+  - /vast/pdt9929/datasets/nsynth/nsynth-valid/wav-tokenizer-codes
+test_data_path: 
+  - /vast/pdt9929/datasets/nsynth/nsynth-test/wav-tokenizer-codes
+batch_size: 200
+v_frequency: 10
+verbos: True
+encoder_epochs: 1000
+train_encoder: False
+train_continue: False
+epochs: 500
+instruments: null #[759] #[759, 417, 644, 97] #, 43, 701, 123, 37, 701, 488, 914, 224, 572, 82] #, 327] [771]
+num_workers: 0
+emb_dim: 512
+encoder_type: null
+num_enc_layers: 1
+decoder_type: "transformer_decoder"
+loss_type: "hierarchical_nll"
+disentangle: "decoder"
+d_conv_size: null
+n_FiLM: null
+reconstruction: "disentangle"
+sample: "instrument"
+num_dec_layers: 2
+input_type: "discrete"
+codes: "unchanged"
+codebook: "learned"
+input_dim: null
+cosine_loss: False
+num_heads: 64
+c_length: null
