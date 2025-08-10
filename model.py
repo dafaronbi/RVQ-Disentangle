@@ -315,7 +315,14 @@ class new_model(nn.Module):
                 Rearrange("b t d -> b d t"),
             )
 
-        self.p_enc = torch.nn.Embedding(128,self.emb_dim)
+        self.p_enc = torch.nn.Embedding(128,self.emb_dim//4)
+        self.v_enc = torch.nn.Embedding(5,self.emb_dim//4)
+        self.proj_matrix_prime = [torch.nn.Embedding(1025,self.emb_dim//2).to(self.device) for i in range(9)]
+        self.enc_prime = nn.Sequential(
+                Rearrange("b d t -> b t d"),
+                nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=self.emb_dim//2, nhead=self.num_heads, batch_first=True), num_layers=self.training_params["num_enc_layers"]),
+                Rearrange("b t d -> b d t"),
+            )
 
         self.dec = nn.Sequential()
 
@@ -335,6 +342,8 @@ class new_model(nn.Module):
         
         if self.training_params["encoder_type"] == "stride":
             self.dec = nn.Sequential(
+                nn.Linear(512,1024),
+                nn.ReLU(),
                 nn.ConvTranspose1d(in_channels=d_size, out_channels=d_size, kernel_size=16, stride=16, padding=4, dilation=1),
                 bNorm(d_size,self.device),
                 nn.ReLU()
@@ -484,7 +493,7 @@ class new_model(nn.Module):
         self.filter_generator = FilterGenerator(32, 32, 1, 32)
         
     
-    def forward(self, dacModel, z,p, z_prime,p_prime):
+    def forward(self, dacModel, z,p, v, z_prime,p_prime, v_prime):
 
         #loss categorical and regression loss functions
         if self.training_params["loss_type"] == "hierarchical_nll":
@@ -512,6 +521,7 @@ class new_model(nn.Module):
         #get latent from audio input
         d_emb = torch.zeros(z.shape[0],  z.shape[-1], 0,self.input_emb_dim).to(self.device)
 
+        #get codebooks of input signals
         for i in range(9):
             if self.training_params["codebook"] == "learned":
                 d_emb = torch.cat((d_emb,self.proj_matrix[i](z_codes[:,i,:]).unsqueeze(-2)), dim =-2)
@@ -521,19 +531,37 @@ class new_model(nn.Module):
                 temp_emb = einops.rearrange(temp_emb, "b d t -> b t (1) d")
                 d_emb = torch.cat((d_emb,temp_emb), dim=-2)
 
+        d_emb_prime = torch.zeros(z.shape[0],  z.shape[-1], 0,self.emb_dim//2).to(self.device)
+
+        #get codebooks of prime signal
+        for i in range(9):
+            if self.training_params["codebook"] == "learned":
+                d_emb_prime = torch.cat((d_emb_prime,self.proj_matrix_prime[i](z_prime_codes[:,i,:]).unsqueeze(-2)), dim =-2)
+
+            if self.training_params["codebook"] == "default":
+                temp_emb = dacModel.quantizer.quantizers[i].decode_code(z_prime_codes[:,i,:])
+                temp_emb = dacModel.quantizer.quantizers[i].out_proj(temp_emb)
+                temp_emb = einops.rearrange(temp_emb, "b d t -> b t (1) d")
+                d_emb_prime = torch.cat((d_emb_prime,temp_emb), dim=-2)
+
         if self.training_params["codes"] == "flattened":
             z_codes = z_codes.flatten(1)
             z_prime_codes = z_prime_codes.flatten(1)
             d_emb = d_emb.flatten(1,2)
+            d_emb_prime = d_emb_prime.flatten(1,2)
         else:
             d_emb = d_emb.sum(2)
+            d_emb_prime = d_emb_prime.sum(2)
         
         d_emb = einops.rearrange(d_emb, "b t d -> b d t")
+        d_emb_prime = einops.rearrange(d_emb_prime, "b t d -> b d t")
 
         if self.training_params["input_type"] == "continuous":
             input_emb = z
+            input_emb_prime = z_prime
         else:
             input_emb = d_emb
+            input_emb_prime = d_emb_prime
         
         # latent = torch.cat((torch.zeros(z.shape[0], z.shape[1],1).to(self.device), z),-1)
         latent = self.enc(input_emb)
@@ -552,14 +580,23 @@ class new_model(nn.Module):
         else:
             c_length = latent.shape[-1]
 
-        #extend the length of pitch to be size of latent space
-        p = einops.repeat(p, "b  -> b (t )",t=c_length)
-        note_num = p_prime[0]
-        p_prime = einops.repeat(p_prime, "b  -> b (t )",t=c_length) 
+        
+        t_prime = self.enc_prime(input_emb_prime)[:, :, -1]
 
-        #get pitch embeddings
+        #extend the length of conditions to be size of latent space
+        p = einops.repeat(p, "b  -> b (t )",t=c_length)
+        v = einops.repeat(v//25 - 1, "b  -> b (t )",t=c_length)
+        note_num = p_prime[0]
+        p_prime = einops.repeat(p_prime, "b  -> b (t )",t=c_length)
+        v_prime = einops.repeat(v_prime//25 - 1, "b  -> b (t )",t=c_length)
+          
+
+        #get condition embeddings
         p_latent = einops.rearrange(self.p_enc(p), "b t d -> b d t")
         p_prime_latent = einops.rearrange(self.p_enc(p_prime), "b t d -> b d t")
+        v_latent = einops.rearrange(self.p_enc(v), "b t d -> b d t")
+        v_prime_latent = einops.rearrange(self.p_enc(v_prime), "b t d -> b d t")
+        t_prime_latent = einops.repeat(t_prime, "b d -> b d t",t=c_length)
 
         if self.training_params["reconstruction"] == "same":
             p_prime_latent = p_latent
@@ -595,6 +632,12 @@ class new_model(nn.Module):
             rest_emb = latent - p_latent
             self.rest_emb = rest_emb
             dec_input = rest_emb + p_prime_latent
+            z_hat = self.dec(dec_input)
+        
+        if self.training_params["disentangle"] == "add":
+            rest_emb = latent + p_latent
+            self.rest_emb = latent
+            dec_input = rest_emb
             z_hat = self.dec(dec_input)
 
         if self.training_params["disentangle"] == None:
@@ -703,7 +746,8 @@ class new_model(nn.Module):
             self.rest_emb = rest_emb
             dec_input = latent
 
-            z_hat = self.dec(dec_input, p_prime_latent)
+            cond_input = torch.cat((p_prime_latent, v_prime_latent, t_prime_latent), dim=1)
+            z_hat = self.dec(dec_input, cond_input)
 
         if self.training_params["loss_type"] == "mse":
             loss = MSE_loss

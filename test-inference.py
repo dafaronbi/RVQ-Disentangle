@@ -126,6 +126,7 @@ parser.add_argument('-i', '--instruments', help="instruments of dataset", type=l
 parser.add_argument('-b', '--batch_size', help="batch_size of dataloader", type=int, default=100)
 parser.add_argument('-r', '--recon', help="reconstructing input signal (same) or prime signal (disentangle)", default="same")
 parser.add_argument('-in', '--input_t', help="discrete or continuous input type", default="discrete")
+parser.add_argument('-s', '--sample', help="sample transformation randomly or same instrument", choices=["instruments", "random"], default="instrument")
 args = parser.parse_args()
 
 
@@ -145,9 +146,9 @@ disentangle.eval()
 #log for tensorboard
 writer = SummaryWriter("tensorboard/inference_runs/" +  args.model[13:-3] + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
-data = dataset.NSynth_transform_ram(args.dataset,instruments=args.instruments, velocities=[127])
+data = dataset.NSynth_transform_ram(args.dataset,instruments=args.instruments, sample=args.sample)
 test_loader = torch.utils.data.DataLoader(data, batch_size=args.batch_size, sampler=PitchRangeSampler(data), drop_last=True, num_workers=0*gpu_count)
-v_data = dataset.NSynth_transform_ram(args.dataset, instruments=None)
+v_data = dataset.NSynth_transform_ram(args.dataset, instruments=None, sample=args.sample)
 valid_loader = torch.utils.data.DataLoader(v_data, batch_size=args.batch_size, sampler=PitchRangeSampler(v_data), drop_last=False, num_workers=0*gpu_count)
 
 #create DAC encoder and decoder
@@ -156,17 +157,17 @@ model = dac.DAC.load(model_path).to(device)
 model.eval()
 
 
-z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = next(iter(test_loader))
+z,p,mfcc,v,inst,z_prime,p_prime,mfcc_prime,v_prime,inst_prime = next(iter(test_loader))
 
 z = z.to(device)[:,0,:,:]
 p = p.to(device)
 mfcc = mfcc.to(device)
-rms = rms.to(device)
+v = v.to(device)
 inst = inst.to(device)
 z_prime = z_prime.to(device)[:,0,:,:]
 p_prime = p_prime.to(device)
 mfcc_prime = mfcc_prime.to(device)
-rms_prime = rms_prime.to(device)
+v_prime = v_prime.to(device)
 inst_prime = inst_prime.to(device)
 
 if "test_reconstruct_accuracy" in args.experiments:
@@ -294,7 +295,7 @@ if "test_reconstruct_accuracy" in args.experiments:
 
 if "test_reconstruct" in args.experiments:
     print("<============test_reconstruct==================>")
-    l,predict = disentangle(model, z,p,z_prime,p_prime)
+    l,predict = disentangle(model, z,p, v, z_prime,p_prime, v_prime)
 
     z_prime_codes = z_prime
     z_prime = model.quantizer.from_codes(z_prime_codes[0].unsqueeze(0))[0]
@@ -353,19 +354,21 @@ if "test_pitch_sweep" in args.experiments:
         input_audio = model.decode(z)
 
     
-    writer.add_audio(f"Audio/Ground Truth={p[0].item()}:"  , input_audio[0])
+    writer.add_audio(f"Audio/Ground Truth p={p[0].item()}, v={v[0].item()}:"  , input_audio[0])
 
-    for p_p in torch.tensor([num for num in [34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,45,46,47,
-    48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,
-    75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90]]).to(device):
-        l,predict = disentangle(model, z_codes[0].unsqueeze(0),p[0].unsqueeze(0),z_prime[0].unsqueeze(0),p_p.unsqueeze(0))
-        out_codes = predict["z"]
-        out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
+    # for p_p in torch.tensor([num for num in [34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,45,46,47,
+    # 48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,
+    # 75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90]]).to(device):
+    for p_p in torch.tensor([num for num in [36, 37, 38, 39, 40, 41, 42, 43, 44,45,46,47]]).to(device):
+        for v_v in torch.tensor([num for num in [25, 50, 75, 100, 127]]).to(device):
+            l,predict = disentangle(model, z_codes[0].unsqueeze(0), p[0].unsqueeze(0), v[0].unsqueeze(0), z_prime[0].unsqueeze(0),p_p.unsqueeze(0), v_v.unsqueeze(0))
+            out_codes = predict["z"]
+            out = model.quantizer.from_codes(out_codes[0].unsqueeze(0))[0]
 
-        with torch.no_grad():
-            output_audio = model.decode(out)
-            
-        writer.add_audio(f"Audio/Reconstruction pitch={p_p.item()}" , output_audio[0])
+            with torch.no_grad():
+                output_audio = model.decode(out)
+                
+            writer.add_audio(f"Audio/Reconstruction pitch={p_p.item()}, v={v_v.item()}" , output_audio[0])
 
     writer.flush()
 

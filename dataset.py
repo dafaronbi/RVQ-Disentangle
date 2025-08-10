@@ -280,8 +280,15 @@ class NSynth_transform_ram(data.Dataset):
 
         #get random second data point
         if self.sample_method == "random":
-            r_index = random.randint(0, len(self)-1)
-            r_data = self.data[r_index]
+            i_index = random.randint(0, len(self)-1)
+            i_data = self.data[i_index-75:i_index+75]
+            i_data = [ d for d in i_data if d[1]["pitch"].item() in range(36,47)]
+
+            if len(i_data):
+                r_index = random.randint(0, len(i_data)-1)
+                r_data = i_data[r_index]
+            else:
+                r_data = data
 
         # print(data[1]["instrument"])
 
@@ -290,7 +297,7 @@ class NSynth_transform_ram(data.Dataset):
             i_data = self.data[index-75:index+75]
             i_data = [ d for d in i_data if d[1]["instrument"] in [data[1]["instrument"]]]
             i_data = [ d for d in i_data if d[1]["pitch"].item() in range(36,47)]
-            i_data = [ d for d in i_data if d[1]["velocity"] in [data[1]["velocity"]]]
+            # i_data = [ d for d in i_data if d[1]["velocity"] in [data[1]["velocity"]]]
 
             if len(i_data):
                 r_index = random.randint(0, len(i_data)-1)
@@ -303,14 +310,14 @@ class NSynth_transform_ram(data.Dataset):
         z = data[0]
         p = data[1]["pitch"]
         mfcc = data[2]
-        rms = data[3]
+        v = data[1]["velocity"]
         inst = data[1]["instrument"]
 
         #transormed data
         z_prime = r_data[0]
         p_prime = r_data[1]["pitch"]
         mfcc_prime = r_data[2]
-        rms_prime = r_data[3]
+        v_prime = r_data[1]["velocity"]
         inst_prime = r_data[1]["instrument"]
 
         #normalize data
@@ -318,7 +325,7 @@ class NSynth_transform_ram(data.Dataset):
         # z_prime = (z_prime - self.z_min) / ( self.z_max -self.z_min)
         mfcc = (mfcc - self.mfcc_min) / ( self.mfcc_max -self.mfcc_min)
         
-        return [z[0], p[0], mfcc[0], rms[0], inst[0], z_prime[0], p_prime[0], mfcc_prime[0], rms_prime[0], inst_prime[0]]
+        return [z[0], p[0], mfcc[0], v[0], inst[0], z_prime[0], p_prime[0], mfcc_prime[0], v_prime[0], inst_prime[0]]
 
 class NSynth_test_bass(data.Dataset):
 

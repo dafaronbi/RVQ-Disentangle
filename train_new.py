@@ -224,7 +224,8 @@ class PitchRangeSampler(Sampler[int]):
     def __init__(self, dataset: torch.utils.data.Dataset, shuffle: bool = True, pitch_range: list = list(range(36,47))) -> None:
         self.dataset = dataset
         self.shuffle = shuffle
-        self.pitch_range = pitch_range 
+        self.pitch_range = pitch_range
+        self.indices = list(range(len(self.dataset))) 
 
     def __iter__(self) -> Iterator[int]:
 
@@ -242,11 +243,12 @@ class PitchRangeSampler(Sampler[int]):
         for idx in indices:
             if self.dataset[idx][1].item() in self.pitch_range:
                 indices_to_keep.append(idx)
-        
+
+        self.indices = indices_to_keep
         return iter(indices_to_keep)
 
     def __len__(self) -> int:
-        return len(self.data_source)
+        return len(self.indices)
 
 
 def ddp_setup(rank: int, world_size: int):
@@ -430,12 +432,12 @@ def main(rank, world_size):
         loss_total_e = 0
 
         for (batch_idx, train_tensors) in enumerate(train_loader):
-            z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = train_tensors   
+            z,p,mfcc,v,inst,z_prime,p_prime,mfcc_prime,v_prime,inst_prime = train_tensors   
             z = z.to(device)[:,0,:,:]
             p = p.to(device)
             z_prime = z_prime.to(device)[:,0,:,:]
             p_prime = p_prime.to(device)
-            l,p = m(dac_model, z,p,z_prime,p_prime)
+            l,p = m(dac_model, z,p,v, z_prime,p_prime, v_prime)
 
             loss = l["t_predict"] + l["cosine"] + l["emb"]
 
@@ -493,13 +495,13 @@ def main(rank, world_size):
             #     rest_emb = torch.zeros((0, 512)).to(device)
 
             #     for (batch_idx, train_tensors) in enumerate(valid_loader):
-            #         z,p,mfcc,rms,inst,z_prime,p_prime,mfcc_prime,rms_prime,inst_prime = train_tensors   
+            #         z,p,mfcc,v,inst,z_prime,p_prime,mfcc_prime,v_prime,inst_prime = train_tensors   
 
             #         z = z.to(device)[:,0,:,:]
             #         p = p.to(device)
             #         z_prime = z_prime.to(device)[:,0,:,:]
             #         p_prime = p_prime.to(device)
-            #         l,p= m(dac_model, z,p,z_prime, p_prime)
+            #         l,p= m(dac_model, z,p,v,z_prime, p_prime,v_prime)
 
             #         if training_params["reconstruction"] == "same":
             #             target_z = z
